@@ -1,0 +1,30 @@
+[package]
+name = "fe2o3-ferrite"
+version = "0.0.1"
+edition = "2021"
+authors = ["Geir Isene <g@isene.com>"]
+description = "An embedded SQL database in Rust, built to beat SQLite at small reads and writes."
+license = "Unlicense"
+repository = "https://github.com/isene/ferrite"
+readme = "README.md"
+
+[lib]
+name = "ferrite"
+
+[dependencies]
+# Only the bench needs SQLite, to measure ferrite against it. Nothing in
+# the library links it, so a normal build pulls in no dependency at all.
+rusqlite = { version = "0.32", optional = true }
+
+[features]
+bench = ["dep:rusqlite"]
+
+[[bin]]
+name = "ferrite-bench"
+path = "src/bin/bench.rs"
+required-features = ["bench"]
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
