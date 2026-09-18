@@ -230,7 +230,7 @@ mod sqlite {
 
 mod engine {
     use super::*;
-    use ferrite::{Db, Kind, Statement, TableId, Value};
+    use ferrite::{Db, Durability, Kind, Statement, TableId, Value};
 
     pub struct Ferrite {
         db: Db,
@@ -257,11 +257,24 @@ mod engine {
         put: Statement,
         get: Statement,
         set: Statement,
+        on_disk: bool,
     }
 
     impl FerriteSql {
-        pub fn open() -> FerriteSql {
-            let mut db = Db::new();
+        pub fn open() -> FerriteSql { Self::make(None) }
+
+        /// The same thing with its files on disk, so that it can be put
+        /// beside SQLite in the same durability mode.
+        pub fn on_disk(dir: &std::path::Path, mode: Durability) -> FerriteSql {
+            let _ = std::fs::remove_dir_all(dir);
+            Self::make(Some((dir.to_path_buf(), mode)))
+        }
+
+        fn make(files: Option<(std::path::PathBuf, Durability)>) -> FerriteSql {
+            let mut db = match &files {
+                Some((dir, mode)) => Db::open_with(dir, *mode).expect("open"),
+                None => Db::new(),
+            };
             db.execute(
                 "CREATE TABLE kv (id INTEGER PRIMARY KEY, a INTEGER, b REAL, c TEXT)",
                 &[],
@@ -271,17 +284,31 @@ mod engine {
             let get = db.prepare("SELECT a FROM kv WHERE id = ?1").unwrap();
             let set = db.prepare("UPDATE kv SET a = ?2 WHERE id = ?1").unwrap();
             assert!(get.is_point_lookup(), "the lookup did not plan as a point lookup");
-            FerriteSql { db, rows: 0, put, get, set }
+            let on_disk = files.is_some();
+            FerriteSql { db, rows: 0, put, get, set, on_disk }
         }
     }
 
     impl Engine for FerriteSql {
         fn name(&self) -> String {
-            format!("ferrite {}, through SQL, statements prepared once", env!("CARGO_PKG_VERSION"))
+            match self.db.durability() {
+                Some(d) => format!(
+                    "ferrite {}, on disk, {}",
+                    env!("CARGO_PKG_VERSION"),
+                    if d == Durability::Full { "synchronous=FULL" } else { "synchronous=NORMAL" }
+                ),
+                None => format!(
+                    "ferrite {}, through SQL, in memory, statements prepared once",
+                    env!("CARGO_PKG_VERSION")
+                ),
+            }
         }
 
         fn load(&mut self, rows: u64) -> Vec<u64> {
             let mut each = Vec::with_capacity(rows as usize);
+            // A bulk load is one transaction, so the whole batch shares
+            // one commit and one fsync. That is what makes it bulk.
+            if self.on_disk { self.db.execute("BEGIN", &[]).expect("begin"); }
             for i in 0..rows {
                 let t0 = Instant::now();
                 self.put
@@ -296,6 +323,13 @@ mod engine {
                     )
                     .expect("insert");
                 each.push(t0.elapsed().as_nanos() as u64);
+            }
+            if self.on_disk {
+                let t0 = Instant::now();
+                self.db.execute("COMMIT", &[]).expect("commit");
+                if let Some(last) = each.last_mut() {
+                    *last += t0.elapsed().as_nanos() as u64;
+                }
             }
             self.rows = rows;
             each
@@ -346,7 +380,6 @@ mod engine {
 
         fn load(&mut self, rows: u64) -> Vec<u64> {
             let mut each = Vec::with_capacity(rows as usize);
-            let t = self.db.table_mut(self.kv);
             for i in 0..rows {
                 // The text is built inside the timed part, the way
                 // SQLite's side builds it, so neither engine is handed a
@@ -357,7 +390,7 @@ mod engine {
                     Value::Real(i as f64 * 1.5),
                     Value::Text(format!("row {i}")),
                 ];
-                t.insert(i as i64, row).expect("insert");
+                self.db.insert(self.kv, i as i64, row).expect("insert");
                 each.push(t0.elapsed().as_nanos() as u64);
             }
             self.rows = rows;
@@ -387,8 +420,7 @@ mod engine {
                 let t0 = Instant::now();
                 if write {
                     self.db
-                        .table_mut(self.kv)
-                        .update(key, 0, Value::Int(key + 1))
+                        .update(self.kv, key, 0, Value::Int(key + 1))
                         .expect("update");
                 } else {
                     let _ = self.db.table(self.kv).get_at(key, 0).expect("select");
@@ -416,12 +448,12 @@ fn phase2_gate(rows: u64, batches: u64, per_batch: u64) -> (f64, f64) {
         .create_table("kv", &[("a", Kind::Int), ("b", Kind::Real), ("c", Kind::Text)])
         .unwrap();
     for i in 0..rows {
-        db.table_mut(kv)
-            .insert(
-                i as i64,
-                vec![Value::Int(i as i64), Value::Real(i as f64 * 1.5), Value::Text(format!("row {i}"))],
-            )
-            .unwrap();
+        db.insert(
+            kv,
+            i as i64,
+            vec![Value::Int(i as i64), Value::Real(i as f64 * 1.5), Value::Text(format!("row {i}"))],
+        )
+        .unwrap();
     }
     let get = db.prepare("SELECT a FROM kv WHERE id = ?1").unwrap();
     assert!(get.is_point_lookup());
@@ -710,7 +742,34 @@ fn main() {
         "\nPhase 2 gate: a prepared lookup costs {gap:.1}% more than the plain Rust call.\n  {sql_ns:.0} ns against {plain_ns:.0} ns a lookup, side by side. The gate is 10%."
     );
 
-    println!("\nDurability is phase 3. These rows promise nothing about a power cut.");
+    // ferrite with its files on disk, in both modes, beside SQLite's
+    // two tables above.
+    for mode in [ferrite::Durability::Full, ferrite::Durability::Normal] {
+        let path = dir.join("ferrite.db");
+        let mut collected: Vec<Vec<Run>> = Vec::new();
+        let mut title = String::new();
+        for go in 0..goes {
+            let mut db = engine::FerriteSql::on_disk(&path, mode);
+            if go == 0 { title = db.name(); }
+            let mut rng = Rng::new(0x5EED_1234 + go as u64);
+            collected.push(vec![
+                measure(&mut db, "bulk insert", |e| e.load(ROWS)),
+                measure(&mut db, "all reads", |e| e.reads(READ_OPS, &mut Rng::new(1 + go as u64))),
+                measure(&mut db, "95/5 read-update", |e| e.mixed(MIXED_OPS, 50, &mut rng)),
+                measure(&mut db, "50/50 read-update", |e| e.mixed(MIXED_OPS, 500, &mut rng)),
+            ]);
+        }
+        let mut runs = Vec::new();
+        for i in 0..4 {
+            let per_workload: Vec<Run> = collected.iter_mut().map(|g| std::mem::replace(
+                &mut g[i],
+                Run { what: "", ops: 0, wall_ns: 1, cpu_ns: 0, each: Vec::new() },
+            )).collect();
+            runs.push(median_run(per_workload).0);
+        }
+        table(&title, &mut runs);
+        let _ = std::fs::remove_dir_all(&path);
+    }
 }
 
 #[cfg(not(feature = "bench"))]

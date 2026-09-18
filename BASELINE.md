@@ -152,6 +152,61 @@ It found four real faults, none of which a hand-written test had caught:
 One difference is on purpose: SQLite will put a string in an INTEGER
 column, and ferrite refuses.
 
+## Phase 3: durability
+
+An append-only log with a checksum on every record, a snapshot when the
+log passes 4 MB, and two modes. Both tables below are ferrite with its
+files on the same disk as SQLite's.
+
+| workload | SQLite FULL | ferrite FULL | SQLite NORMAL | ferrite NORMAL |
+|---|---|---|---|---|
+| bulk insert | 1 184 987 | 580 038 | 1 261 124 | 525 160 |
+| all reads | 422 223 | 1 718 041 | 421 944 | 1 695 957 |
+| 95/5 read-update | 44 988 | 77 028 | 289 953 | 991 100 |
+| 50/50 read-update | 10 310 | 10 272 | 116 886 | 270 729 |
+
+**The crash gate is met.** 10,000 runs a mode, each one a child process
+killed with SIGKILL while it was writing. Every key the parent had seen
+committed was in the database afterwards, no run left a hole in the
+middle, and no run left files that would not open. It took 2 minutes 24.
+
+**Two targets are met and two are missed.**
+
+| workload | target | got | |
+|---|---|---|---|
+| 95/5, FULL | match SQLite | 77 028 against 44 988 | beaten |
+| 50/50, FULL | match SQLite | 10 272 against 10 310 | met, 0.4% apart |
+| 95/5, NORMAL | 1 000 000 | 991 100 | 1% under |
+| all reads | 2 000 000 | 1 718 041 on disk | 14% under |
+| 50/50, NORMAL | 500 000 | 270 729 | missed, and still 2.3 times SQLite |
+| bulk insert | 3 000 000 | 580 038 | missed by a long way |
+
+Bulk insert is the bad one. ferrite loads 100,000 rows at half SQLite's
+rate. Two things are in the way, and both are phase 5 work.
+
+- The whole batch is one commit, so a 10 MB record is built, written and
+  then immediately answered by a snapshot, because the log has passed
+  its size. Both engines do housekeeping here; ferrite does more of it.
+- Each row is checked twice, once to see whether it can go in the log
+  and once by the table itself.
+
+### Two measurements that were wrong
+
+**Claiming log space made it worse before it made it better.** Every
+append that lengthens a file makes the filesystem write its own journal
+too, which is a second trip to the disk on every commit.
+
+Claiming a megabyte ahead with `set_len` did not help. It made the file
+longer without putting anything there, so the first write into each new
+block paid the same cost anyway, and 50/50 in FULL fell from 4 600 to
+1 020 operations a second. Writing real zeros put the blocks down for
+good, and 95/5 in FULL went from 40 582 to 77 028.
+
+**Copying every row on its way to the log cost over a microsecond an
+insert.** Changes are now written as bytes as they happen, straight from
+the row, and a commit is one buffer with its header filled in at the
+end.
+
 ## A trap this bench fell into
 
 The first run reported a 3 µs fsync and near-identical FULL and NORMAL

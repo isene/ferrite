@@ -408,7 +408,7 @@ impl Statement {
         self.check(params)?;
         match &self.plan {
             Plan::Begin => { db.begin(); Ok(Outcome::Done) }
-            Plan::Commit => { db.commit(); Ok(Outcome::Done) }
+            Plan::Commit => { db.commit()?; Ok(Outcome::Done) }
             Plan::Rollback => { db.rollback(); Ok(Outcome::Done) }
 
             Plan::CreateTable { name, key, columns, if_missing } => {
@@ -428,20 +428,16 @@ impl Statement {
                     .iter()
                     .map(|e| value_of(e, params).cloned())
                     .collect::<Result<Row>>()?;
-                db.table_mut(*table).insert(key, row)?;
-                db.note_insert(*table, key);
+                db.insert(*table, key, row)?;
                 Ok(Outcome::Changed(1))
             }
 
             Plan::Update { table, sets, filter } => {
                 let keys = self.matching(db, *table, filter, params)?;
                 for key in &keys {
-                    db.note_change(*table, *key);
-                }
-                for key in &keys {
                     for (col, e) in sets {
                         let v = value_of(e, params)?.clone();
-                        db.table_mut(*table).update(*key, *col, v)?;
+                        db.update(*table, *key, *col, v)?;
                     }
                 }
                 Ok(Outcome::Changed(keys.len()))
@@ -450,8 +446,7 @@ impl Statement {
             Plan::Delete { table, filter } => {
                 let keys = self.matching(db, *table, filter, params)?;
                 for key in &keys {
-                    db.note_change(*table, *key);
-                    db.table_mut(*table).delete(*key);
+                    db.delete(*table, *key)?;
                 }
                 Ok(Outcome::Changed(keys.len()))
             }

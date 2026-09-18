@@ -1,9 +1,15 @@
 //! ferrite: an embedded SQL database that keeps its tables in memory.
 //!
-//! Phase 1 of `PLAN.md`: the core, with no SQL yet. A table holds its
-//! rows in a B-tree map under an integer primary key, and the API is
-//! plain Rust calls. SQL arrives in phase 2 and compiles down to exactly
-//! these calls, so whatever they cost is the floor for everything above.
+//! A table holds its rows in a B-tree map under an integer primary key,
+//! and the API is plain Rust calls. SQL compiles down to exactly those
+//! calls, so whatever they cost is the floor for everything above.
+//!
+//! [`Db::new`] keeps everything in memory and forgets it when the
+//! program ends. [`Db::open`] keeps it in a directory, and **defaults to
+//! NORMAL durability**: a commit is written at once, so a crashed
+//! program loses nothing, but a power cut can lose the last few commits.
+//! [`Durability::Full`] fsyncs every commit and costs about ten times as
+//! much on writes.
 //!
 //! The one design decision that shapes the rest: a caller holds a
 //! [`TableId`] and reaches its table in one array index. Looking a table
@@ -16,16 +22,21 @@
 //!
 //! let mut db = Db::new();
 //! let kv = db.create_table("kv", &[("a", Kind::Int), ("c", Kind::Text)]).unwrap();
-//! db.table_mut(kv).insert(1, vec![Value::Int(7), Value::Text("hello".into())]).unwrap();
+//! db.insert(kv, 1, vec![Value::Int(7), Value::Text("hello".into())]).unwrap();
 //! assert_eq!(db.table(kv).get(1).unwrap()[0], Value::Int(7));
 //! ```
 
+pub mod log;
 pub mod plan;
 pub mod sql;
 
+pub use log::Durability;
 pub use plan::{Outcome, Statement};
 
 use std::collections::{BTreeMap, HashMap};
+use std::path::Path;
+
+use log::{Change, Store};
 
 // ── Values ─────────────────────────────────────────────────────────────
 
@@ -117,6 +128,8 @@ pub enum Error {
     NotNull(String),
     /// The SQL could not be read, or asks for something that is not there.
     Sql(String),
+    /// Something went wrong with the files on disk.
+    Disk(String),
 }
 
 impl std::fmt::Display for Error {
@@ -135,6 +148,7 @@ impl std::fmt::Display for Error {
             Error::NoColumn(i) => write!(f, "there is no column {i}"),
             Error::NotNull(c) => write!(f, "column {c} cannot be empty"),
             Error::Sql(s) => write!(f, "{s}"),
+            Error::Disk(s) => write!(f, "the database files: {s}"),
         }
     }
 }
@@ -165,6 +179,9 @@ pub type Row = Vec<Value>;
 #[derive(Debug, Clone)]
 pub struct Table {
     name: String,
+    /// True once the table has been thrown away. The slot stays, because
+    /// the log names tables by their number.
+    dropped: bool,
     /// What the primary key is called in SQL. The key is not stored in
     /// the row; it is what the row is filed under.
     key: String,
@@ -244,6 +261,32 @@ impl Table {
         self.rows.range(from..to.max(from)).map(|(k, r)| (*k, r))
     }
 
+    /// Would this row go in under this key?
+    pub(crate) fn can_insert(&self, key: i64, row: &Row) -> Result<()> {
+        self.check(row)?;
+        if self.rows.contains_key(&key) { return Err(Error::KeyExists(key)); }
+        Ok(())
+    }
+
+    /// Does this row fit the columns?
+    pub(crate) fn fits_row(&self, row: &Row) -> Result<()> { self.check(row) }
+
+    /// Would this change to one value work?
+    pub(crate) fn can_update(&self, key: i64, column: usize, value: &Value) -> Result<()> {
+        let col = self.columns.get(column).ok_or(Error::NoColumn(column))?;
+        if *value == Value::Null {
+            if !col.null_ok { return Err(Error::NotNull(col.name.clone())); }
+        } else if !value.fits(col.kind) {
+            return Err(Error::WrongKind {
+                column: col.name.clone(),
+                want: col.kind.name(),
+                got: value.type_name(),
+            });
+        }
+        if !self.rows.contains_key(&key) { return Err(Error::NoKey(key)); }
+        Ok(())
+    }
+
     fn check(&self, row: &Row) -> Result<()> {
         if row.len() != self.columns.len() {
             return Err(Error::WrongWidth { want: self.columns.len(), got: row.len() });
@@ -285,6 +328,14 @@ pub struct Db {
     /// Nothing is recorded outside a transaction, so the usual path
     /// costs one boolean test.
     undo: Vec<Undo>,
+    /// The files, when this database has any. Without them it is a
+    /// database in memory that forgets everything when the program ends.
+    store: Option<Store>,
+    /// The commit being built, as the bytes that will go to the log.
+    /// Keeping bytes rather than a list of changes means a row never has
+    /// to be copied on its way to the disk.
+    journal: Vec<u8>,
+    journal_count: u32,
 }
 
 /// One step backwards.
@@ -316,11 +367,18 @@ impl Db {
         let id = TableId(self.tables.len());
         self.tables.push(Table {
             name: name.to_string(),
+            dropped: false,
             key: key.to_string(),
             columns,
             rows: BTreeMap::new(),
         });
         self.by_name.insert(name.to_string(), id.0);
+        let columns = self.tables[id.0].columns.clone();
+        self.record(Change::NewTable {
+            name: name.to_string(),
+            key: key.to_string(),
+            columns,
+        })?;
         Ok(id)
     }
 
@@ -332,8 +390,11 @@ impl Db {
     #[inline]
     pub fn table(&self, id: TableId) -> &Table { &self.tables[id.0] }
 
+    /// A table to change directly. This does not reach the log, so it
+    /// is only for the inside of the crate, where the caller has already
+    /// arranged for the change to be recorded.
     #[inline]
-    pub fn table_mut(&mut self, id: TableId) -> &mut Table { &mut self.tables[id.0] }
+    fn table_mut(&mut self, id: TableId) -> &mut Table { &mut self.tables[id.0] }
 
     pub fn table_names(&self) -> impl Iterator<Item = &str> {
         self.tables.iter().map(|t| t.name.as_str())
@@ -369,14 +430,20 @@ impl Db {
         self.undo.clear();
     }
 
-    pub fn commit(&mut self) {
+    /// Finish a transaction. Everything it did goes to the log as one
+    /// record, which is why a batch of writes costs one fsync and not
+    /// one each.
+    pub fn commit(&mut self) -> Result<()> {
         self.in_txn = false;
         self.undo.clear();
+        self.write_journal()
     }
 
     /// Put everything back the way it was at BEGIN.
     pub fn rollback(&mut self) {
         self.in_txn = false;
+        self.journal.clear();
+        self.journal_count = 0;
         while let Some(step) = self.undo.pop() {
             match step {
                 Undo::Added(id, key) => { self.tables[id.0].rows.remove(&key); }
@@ -407,8 +474,226 @@ impl Db {
     pub fn drop_table(&mut self, name: &str) -> Result<()> {
         let i = *self.by_name.get(name).ok_or_else(|| Error::NoTable(name.to_string()))?;
         self.tables[i].rows.clear();
-        self.tables[i].columns.clear();
+        self.tables[i].dropped = true;
         self.by_name.remove(name);
+        self.record(Change::DropTable { name: name.to_string() })
+    }
+
+    // ── Changing rows ──────────────────────────────────────────────────
+    //
+    // Every change goes through here, so that the log hears about all of
+    // them. When there is no file and no transaction, none of this costs
+    // more than one test of a boolean.
+
+    /// True when a change has to be written down, either for the log or
+    /// so that a rollback can undo it.
+    #[inline]
+    fn recording(&self) -> bool { self.store.is_some() || self.in_txn }
+
+    /// Make room for another change in the commit being built.
+    #[inline]
+    fn opening(&mut self) -> &mut Vec<u8> {
+        if self.journal.is_empty() { log::begin(&mut self.journal); }
+        self.journal_count += 1;
+        &mut self.journal
+    }
+
+    /// Outside a transaction, one change is one commit, so close it off
+    /// and write it now.
+    #[inline]
+    fn close_if_alone(&mut self) -> Result<()> {
+        if self.in_txn { return Ok(()); }
+        self.write_journal()
+    }
+
+    fn write_journal(&mut self) -> Result<()> {
+        if self.journal_count == 0 {
+            self.journal.clear();
+            return Ok(());
+        }
+        log::finish(&mut self.journal, self.journal_count);
+        if let Some(s) = &mut self.store {
+            s.commit_bytes(&self.journal)?;
+        }
+        self.journal.clear();
+        self.journal_count = 0;
+        self.snapshot_if_grown()
+    }
+
+    /// Put a new row in. It is an error if the key is taken.
+    pub fn insert(&mut self, table: TableId, key: i64, row: Row) -> Result<()> {
+        if self.recording() {
+            // Check before writing anything down, so a row the table
+            // would refuse never reaches the log.
+            self.tables[table.0].can_insert(key, &row)?;
+            let t = table.0 as u32;
+            log::put_row(self.opening(), t, key, &row);
+        }
+        self.tables[table.0].insert(key, row)?;
+        self.note_insert(table, key);
+        self.close_if_alone()
+    }
+
+    /// Put a row in over whatever was there. Gives back the old row.
+    pub fn put(&mut self, table: TableId, key: i64, row: Row) -> Result<Option<Row>> {
+        if self.recording() {
+            self.tables[table.0].fits_row(&row)?;
+            let t = table.0 as u32;
+            log::put_row(self.opening(), t, key, &row);
+        }
+        self.note_change(table, key);
+        let old = self.tables[table.0].put(key, row)?;
+        self.close_if_alone()?;
+        Ok(old)
+    }
+
+    /// Change one value in an existing row.
+    pub fn update(&mut self, table: TableId, key: i64, column: usize, value: Value) -> Result<()> {
+        if self.recording() {
+            self.tables[table.0].can_update(key, column, &value)?;
+            let t = table.0 as u32;
+            log::put_set(self.opening(), t, key, column as u32, &value);
+        }
+        self.note_change(table, key);
+        self.tables[table.0].update(key, column, value)?;
+        self.close_if_alone()
+    }
+
+    /// Take a row out. True when there was one.
+    pub fn delete(&mut self, table: TableId, key: i64) -> Result<bool> {
+        if self.tables[table.0].get(key).is_none() { return Ok(false); }
+        if self.recording() {
+            let t = table.0 as u32;
+            log::put_delete(self.opening(), t, key);
+        }
+        self.note_change(table, key);
+        self.tables[table.0].delete(key);
+        self.close_if_alone()?;
+        Ok(true)
+    }
+
+    // ── The files ──────────────────────────────────────────────────────
+
+    /// Open a database in a directory, making it if it is not there.
+    ///
+    /// **This is NORMAL durability.** A commit is written straight away,
+    /// so a program that crashes loses nothing. A power cut or a kernel
+    /// panic can lose the last few commits. Use [`Db::open_with`] with
+    /// [`Durability::Full`] when that is not good enough.
+    pub fn open(dir: impl AsRef<Path>) -> Result<Db> {
+        Db::open_with(dir, Durability::default())
+    }
+
+    /// Open a database and say how hard a commit should try to survive.
+    pub fn open_with(dir: impl AsRef<Path>, durability: Durability) -> Result<Db> {
+        let (store, commits) = Store::open(dir.as_ref(), durability)?;
+        let mut db = Db::new();
+        for commit in commits {
+            db.replay(commit)?;
+        }
+        db.store = Some(store);
+        Ok(db)
+    }
+
+    /// How hard a commit tries to survive.
+    pub fn durability(&self) -> Option<Durability> {
+        self.store.as_ref().map(|s| s.durability)
+    }
+
+    /// Change how hard a commit tries to survive, from here on.
+    pub fn set_durability(&mut self, d: Durability) {
+        if let Some(s) = &mut self.store { s.durability = d; }
+    }
+
+    /// Force everything committed so far onto the disk. In FULL this has
+    /// already happened; in NORMAL this is how you make sure.
+    pub fn flush(&mut self) -> Result<()> {
+        match &mut self.store {
+            Some(s) => s.flush(),
+            None => Ok(()),
+        }
+    }
+
+    /// Write the whole database out fresh and start the log again.
+    pub fn checkpoint(&mut self) -> Result<()> {
+        let all = self.everything();
+        match &mut self.store {
+            Some(s) => s.snapshot(&all),
+            None => Ok(()),
+        }
+    }
+
+    /// Write a change down that happens rarely enough to build the
+    /// slow way: making or dropping a table.
+    fn record(&mut self, change: Change) -> Result<()> {
+        if !self.recording() { return Ok(()); }
+        log::put_one(self.opening(), &change);
+        self.close_if_alone()
+    }
+
+    fn snapshot_if_grown(&mut self) -> Result<()> {
+        if self.store.as_ref().is_some_and(|s| s.wants_snapshot()) {
+            let all = self.everything();
+            if let Some(s) = &mut self.store { s.snapshot(&all)?; }
+        }
+        Ok(())
+    }
+
+    /// The whole database as a list of changes, for a snapshot. The
+    /// tables come in the order they were made, because the log names
+    /// them by number.
+    fn everything(&self) -> Vec<Change> {
+        let mut out = Vec::new();
+        for (i, t) in self.tables.iter().enumerate() {
+            out.push(Change::NewTable {
+                name: t.name.clone(),
+                key: t.key.clone(),
+                columns: t.columns.clone(),
+            });
+            if t.dropped {
+                out.push(Change::DropTable { name: t.name.clone() });
+                continue;
+            }
+            for (key, row) in &t.rows {
+                out.push(Change::Put { table: i as u32, key: *key, row: row.clone() });
+            }
+        }
+        out
+    }
+
+    /// Put a commit from the log back into the tables. Nothing here is
+    /// written down again: this is the reading side.
+    fn replay(&mut self, changes: Vec<Change>) -> Result<()> {
+        for change in changes {
+            match change {
+                Change::NewTable { name, key, columns } => {
+                    self.create_table_full(&name, &key, columns)?;
+                }
+                Change::DropTable { name } => {
+                    if let Some(i) = self.by_name.remove(&name) {
+                        self.tables[i].rows.clear();
+                        self.tables[i].dropped = true;
+                    }
+                }
+                Change::Put { table, key, row } => {
+                    let t = self.tables.get_mut(table as usize)
+                        .ok_or_else(|| Error::Disk(format!("the log names table {table}, which is not there")))?;
+                    t.rows.insert(key, row);
+                }
+                Change::Set { table, key, col, value } => {
+                    let t = self.tables.get_mut(table as usize)
+                        .ok_or_else(|| Error::Disk(format!("the log names table {table}, which is not there")))?;
+                    if let Some(row) = t.rows.get_mut(&key) {
+                        if let Some(slot) = row.get_mut(col as usize) { *slot = value; }
+                    }
+                }
+                Change::Delete { table, key } => {
+                    let t = self.tables.get_mut(table as usize)
+                        .ok_or_else(|| Error::Disk(format!("the log names table {table}, which is not there")))?;
+                    t.rows.remove(&key);
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -439,7 +724,7 @@ mod tests {
     #[test]
     fn a_row_goes_in_and_comes_back() {
         let (mut db, id) = kv();
-        db.table_mut(id).insert(7, row(7)).unwrap();
+        db.insert(id, 7, row(7)).unwrap();
         assert_eq!(db.table(id).get(7), Some(&row(7)));
         assert_eq!(db.table(id).get_at(7, 0), Some(&Value::Int(7)));
         assert_eq!(db.table(id).len(), 1);
@@ -455,9 +740,9 @@ mod tests {
     #[test]
     fn insert_refuses_to_overwrite_and_put_agrees_to() {
         let (mut db, id) = kv();
-        db.table_mut(id).insert(1, row(1)).unwrap();
-        assert_eq!(db.table_mut(id).insert(1, row(2)), Err(Error::KeyExists(1)));
-        let old = db.table_mut(id).put(1, row(2)).unwrap();
+        db.insert(id, 1, row(1)).unwrap();
+        assert_eq!(db.insert(id, 1, row(2)), Err(Error::KeyExists(1)));
+        let old = db.put(id, 1, row(2)).unwrap();
         assert_eq!(old, Some(row(1)));
         assert_eq!(db.table(id).get_at(1, 0), Some(&Value::Int(2)));
     }
@@ -467,12 +752,12 @@ mod tests {
         let (mut db, id) = kv();
         let short = vec![Value::Int(1)];
         assert_eq!(
-            db.table_mut(id).insert(1, short),
+            db.insert(id, 1, short),
             Err(Error::WrongWidth { want: 3, got: 1 })
         );
         let wrong = vec![Value::Text("no".into()), Value::Real(1.0), Value::Text("x".into())];
         assert_eq!(
-            db.table_mut(id).insert(1, wrong),
+            db.insert(id, 1, wrong),
             Err(Error::WrongKind { column: "a".into(), want: "integer", got: "text" })
         );
     }
@@ -488,12 +773,12 @@ mod tests {
             )
             .unwrap();
         assert_eq!(
-            db.table_mut(id).insert(1, vec![Value::Null]),
+            db.insert(id, 1, vec![Value::Null]),
             Err(Error::NotNull("a".into()))
         );
-        db.table_mut(id).insert(1, vec![Value::Int(1)]).unwrap();
+        db.insert(id, 1, vec![Value::Int(1)]).unwrap();
         assert_eq!(
-            db.table_mut(id).update(1, 0, Value::Null),
+            db.update(id, 1, 0, Value::Null),
             Err(Error::NotNull("a".into()))
         );
     }
@@ -501,23 +786,23 @@ mod tests {
     #[test]
     fn update_changes_one_value_and_checks_it() {
         let (mut db, id) = kv();
-        db.table_mut(id).insert(1, row(1)).unwrap();
-        db.table_mut(id).update(1, 0, Value::Int(99)).unwrap();
+        db.insert(id, 1, row(1)).unwrap();
+        db.update(id, 1, 0, Value::Int(99)).unwrap();
         assert_eq!(db.table(id).get_at(1, 0), Some(&Value::Int(99)));
         assert_eq!(
-            db.table_mut(id).update(1, 0, Value::Text("no".into())),
+            db.update(id, 1, 0, Value::Text("no".into())),
             Err(Error::WrongKind { column: "a".into(), want: "integer", got: "text" })
         );
-        assert_eq!(db.table_mut(id).update(5, 0, Value::Int(1)), Err(Error::NoKey(5)));
-        assert_eq!(db.table_mut(id).update(1, 9, Value::Int(1)), Err(Error::NoColumn(9)));
+        assert_eq!(db.update(id, 5, 0, Value::Int(1)), Err(Error::NoKey(5)));
+        assert_eq!(db.update(id, 1, 9, Value::Int(1)), Err(Error::NoColumn(9)));
     }
 
     #[test]
     fn delete_takes_a_row_out_once() {
         let (mut db, id) = kv();
-        db.table_mut(id).insert(1, row(1)).unwrap();
-        assert!(db.table_mut(id).delete(1));
-        assert!(!db.table_mut(id).delete(1));
+        db.insert(id, 1, row(1)).unwrap();
+        assert!(db.delete(id, 1).unwrap());
+        assert!(!db.delete(id, 1).unwrap());
         assert!(db.table(id).is_empty());
     }
 
@@ -525,7 +810,7 @@ mod tests {
     fn rows_come_back_in_key_order() {
         let (mut db, id) = kv();
         for k in [5, 1, 9, 3] {
-            db.table_mut(id).insert(k, row(k)).unwrap();
+            db.insert(id, k, row(k)).unwrap();
         }
         let keys: Vec<i64> = db.table(id).iter().map(|(k, _)| k).collect();
         assert_eq!(keys, vec![1, 3, 5, 9]);
@@ -538,8 +823,8 @@ mod tests {
         let mut db = Db::new();
         let a = db.create_table("a", &[("x", Kind::Int)]).unwrap();
         let b = db.create_table("b", &[("x", Kind::Int)]).unwrap();
-        db.table_mut(a).insert(1, vec![Value::Int(10)]).unwrap();
-        db.table_mut(b).insert(1, vec![Value::Int(20)]).unwrap();
+        db.insert(a, 1, vec![Value::Int(10)]).unwrap();
+        db.insert(b, 1, vec![Value::Int(20)]).unwrap();
         assert_eq!(db.table(a).get_at(1, 0), Some(&Value::Int(10)));
         assert_eq!(db.table(b).get_at(1, 0), Some(&Value::Int(20)));
         assert_eq!(db.create_table("a", &[]), Err(Error::TableExists("a".into())));
@@ -548,7 +833,7 @@ mod tests {
     #[test]
     fn a_table_is_found_by_name_once_and_then_by_id() {
         let (mut db, id) = kv();
-        db.table_mut(id).insert(1, row(1)).unwrap();
+        db.insert(id, 1, row(1)).unwrap();
         let again = db.table_id("kv").unwrap();
         assert_eq!(again, id);
         assert_eq!(db.table_id("nope"), Err(Error::NoTable("nope".into())));

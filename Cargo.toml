@@ -24,6 +24,10 @@ name = "ferrite-bench"
 path = "src/bin/bench.rs"
 required-features = ["bench"]
 
+[[bin]]
+name = "ferrite-crash"
+path = "src/bin/crash.rs"
+
 [profile.release]
 opt-level = 3
 lto = true
