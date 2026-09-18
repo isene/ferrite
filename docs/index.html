@@ -69,6 +69,7 @@
     tr:last-child td { border-bottom: none; }
     td.win { color: var(--green); font-weight: 600; }
     td.us { color: var(--rust-glow); }
+    .gain { color: var(--fg-mute); font-size: 0.8em; font-weight: 400; white-space: nowrap; }
     .features td { text-align: left; }
     .features td:first-child { color: var(--fg-dim); white-space: nowrap; }
     .note { color: var(--fg-mute); font-size: 0.9rem; }
@@ -109,17 +110,18 @@
       <p class="lede">
         Operations a second. A table of 100,000 rows, read by key, updated
         by key, and loaded in one batch. Median of five runs, ext4 on NVMe,
-        SQLite 3.46 with WAL and prepared statements. Green is the faster one.
+        SQLite 3.46 with WAL and prepared statements. Green is the faster one, and
+        the grey figure is how much more it does than SQLite.
       </p>
       <table>
         <thead>
           <tr><th>workload</th><th>SQLite FULL</th><th>ferrite FULL</th><th>SQLite NORMAL</th><th>ferrite NORMAL</th></tr>
         </thead>
         <tbody>
-          <tr><td>bulk insert</td><td>1 174 336</td><td class="win">1 755 785</td><td>1 258 940</td><td class="win">1 906 607</td></tr>
-          <tr><td>all reads</td><td>422 125</td><td class="win">1 568 619</td><td>418 930</td><td class="win">1 867 973</td></tr>
-          <tr><td>95 reads, 5 updates</td><td>46 832</td><td class="win">81 031</td><td>284 534</td><td class="win">1 357 665</td></tr>
-          <tr><td>50 reads, 50 updates</td><td>10 001</td><td class="win">10 823</td><td>112 041</td><td class="win">709 148</td></tr>
+          <tr><td>bulk insert</td><td>1 174 336</td><td class="win">1 755 785 <span class="gain">+50%</span></td><td>1 258 940</td><td class="win">1 906 607 <span class="gain">+51%</span></td></tr>
+          <tr><td>all reads</td><td>422 125</td><td class="win">1 568 619 <span class="gain">+272%</span></td><td>418 930</td><td class="win">1 867 973 <span class="gain">+346%</span></td></tr>
+          <tr><td>95 reads, 5 updates</td><td>46 832</td><td class="win">81 031 <span class="gain">+73%</span></td><td>284 534</td><td class="win">1 357 665 <span class="gain">+377%</span></td></tr>
+          <tr><td>50 reads, 50 updates</td><td>10 001</td><td class="win">10 823 <span class="gain">+8%</span></td><td>112 041</td><td class="win">709 148 <span class="gain">+533%</span></td></tr>
         </tbody>
       </table>
       <p class="note">
@@ -136,17 +138,18 @@
       <h2>Through an index</h2>
       <p class="lede">
         Microseconds for one lookup on a column that is not the key, with
-        about a thousand rows matching. Lower is better.
+        about a thousand rows matching. Lower is better, and the grey figure is
+        how much less time ferrite takes.
       </p>
       <table>
         <thead>
           <tr><th>asking for</th><th>SQLite</th><th>ferrite</th></tr>
         </thead>
         <tbody>
-          <tr><td>the key only</td><td>123</td><td class="win">53</td></tr>
-          <tr><td>the indexed column</td><td>121</td><td class="win">54</td></tr>
-          <tr><td>a text column, so the row is fetched</td><td>582</td><td class="win">277</td></tr>
-          <tr><td>walking the whole table, no index</td><td>3 661</td><td class="win">2 784</td></tr>
+          <tr><td>the key only</td><td>123</td><td class="win">53 <span class="gain">57% less</span></td></tr>
+          <tr><td>the indexed column</td><td>121</td><td class="win">54 <span class="gain">55% less</span></td></tr>
+          <tr><td>a text column, so the row is fetched</td><td>582</td><td class="win">277 <span class="gain">52% less</span></td></tr>
+          <tr><td>walking the whole table, no index</td><td>3 661</td><td class="win">2 784 <span class="gain">24% less</span></td></tr>
         </tbody>
       </table>
     </div>
