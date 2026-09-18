@@ -1,0 +1,51 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- A plane of ferrite core memory: nine rings on a grid of wires,
+       one of them holding a 1. That is what the name means. -->
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#141420"/>
+      <stop offset="100%" style="stop-color:#08080e"/>
+    </linearGradient>
+    <linearGradient id="rust" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" style="stop-color:#f74c00"/>
+      <stop offset="100%" style="stop-color:#b7410e"/>
+    </linearGradient>
+    <radialGradient id="glow">
+      <stop offset="0%" style="stop-color:#ff7a3a" stop-opacity="0.9"/>
+      <stop offset="100%" style="stop-color:#ff7a3a" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <style>
+    @keyframes pulse { 0%,100% { opacity: 0.55; } 50% { opacity: 1; } }
+    .lit { animation: pulse 2.4s ease-in-out infinite; }
+  </style>
+
+  <circle cx="128" cy="128" r="120" fill="url(#bg)" stroke="url(#rust)" stroke-width="3"/>
+
+  <!-- The wires: three across, three down, threaded through the rings. -->
+  <g stroke="#8a8a94" stroke-width="2.5" stroke-linecap="round" fill="none">
+    <line x1="52" y1="84"  x2="204" y2="84"/>
+    <line x1="52" y1="128" x2="204" y2="128"/>
+    <line x1="52" y1="172" x2="204" y2="172"/>
+    <line x1="84"  y1="52" x2="84"  y2="204"/>
+    <line x1="128" y1="52" x2="128" y2="204"/>
+    <line x1="172" y1="52" x2="172" y2="204"/>
+  </g>
+
+  <!-- The rings, tilted the way cores sit on the wires. -->
+  <g fill="none" stroke="#cfd6e4" stroke-width="6">
+    <ellipse cx="84"  cy="84"  rx="15" ry="10" transform="rotate(-40 84 84)"/>
+    <ellipse cx="128" cy="84"  rx="15" ry="10" transform="rotate(-40 128 84)"/>
+    <ellipse cx="172" cy="84"  rx="15" ry="10" transform="rotate(-40 172 84)"/>
+    <ellipse cx="84"  cy="128" rx="15" ry="10" transform="rotate(-40 84 128)"/>
+    <ellipse cx="172" cy="128" rx="15" ry="10" transform="rotate(-40 172 128)"/>
+    <ellipse cx="84"  cy="172" rx="15" ry="10" transform="rotate(-40 84 172)"/>
+    <ellipse cx="128" cy="172" rx="15" ry="10" transform="rotate(-40 128 172)"/>
+    <ellipse cx="172" cy="172" rx="15" ry="10" transform="rotate(-40 172 172)"/>
+  </g>
+
+  <!-- The one in the middle holds a 1. -->
+  <circle class="lit" cx="128" cy="128" r="30" fill="url(#glow)"/>
+  <ellipse class="lit" cx="128" cy="128" rx="15" ry="10" transform="rotate(-40 128 128)"
+           fill="none" stroke="#ff7a3a" stroke-width="6"/>
+</svg>
