@@ -83,6 +83,31 @@ To be confirmed before phase 1 starts.
 Say the two FULL rows plainly: ferrite will not beat SQLite there. Both
 engines wait on the same disk for the same reason.
 
+## Where ferrite stands
+
+Phase 1: tables in memory, a B-tree map under an integer primary key,
+and a plain Rust API. No log and no fsync yet, so there is one set of
+numbers rather than one per durability mode.
+
+| workload | ops/s | p50 µs | p99 µs | CPU µs/op | against the target |
+|---|---|---|---|---|---|
+| bulk insert | 3 152 865 | 0.27 | 0.40 | 0.32 | met |
+| all reads | 1 951 034 | 0.39 | 0.99 | 0.52 | just under |
+| 95/5 read-update | 2 432 759 | 0.32 | 0.71 | 0.40 | not comparable yet |
+| 50/50 read-update | 2 281 932 | 0.34 | 0.87 | 0.45 | not comparable yet |
+
+**The phase 1 gate is met.** A point read runs at 1 951 034 a second
+against SQLite's 422 223, and costs 0.52 µs of CPU against 2.36 µs.
+That is 4.6 times the throughput for a fifth of the CPU.
+
+**The read target is missed by a hair**, 1.95 million against 2 million,
+and 0.52 µs of CPU against 0.50. Phase 5 is where speed gets worked on
+one measured step at a time, so it stays as it is until then.
+
+**The two mixed rows prove nothing yet.** ferrite writes to memory and
+stops there, while SQLite writes to a disk. Phase 3 adds the log, and
+those two rows will fall. Compare them then, not now.
+
 ## A trap this bench fell into
 
 The first run reported a 3 µs fsync and near-identical FULL and NORMAL

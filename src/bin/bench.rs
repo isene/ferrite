@@ -227,9 +227,87 @@ mod sqlite {
 }
 
 // ── ferrite ────────────────────────────────────────────────────────────
-//
-// Phase 1 puts an engine here. Until then the bench runs SQLite alone,
-// which is exactly what phase 0 asks for: the baseline first.
+
+mod engine {
+    use super::*;
+    use ferrite::{Db, Kind, TableId, Value};
+
+    pub struct Ferrite {
+        db: Db,
+        kv: TableId,
+        rows: u64,
+    }
+
+    impl Ferrite {
+        pub fn open() -> Ferrite {
+            let mut db = Db::new();
+            let kv = db
+                .create_table("kv", &[("a", Kind::Int), ("b", Kind::Real), ("c", Kind::Text)])
+                .expect("create");
+            Ferrite { db, kv, rows: 0 }
+        }
+    }
+
+    impl Engine for Ferrite {
+        fn name(&self) -> String {
+            format!("ferrite {}, in memory, no durability yet", env!("CARGO_PKG_VERSION"))
+        }
+
+        fn load(&mut self, rows: u64) -> Vec<u64> {
+            let mut each = Vec::with_capacity(rows as usize);
+            let t = self.db.table_mut(self.kv);
+            for i in 0..rows {
+                // The text is built inside the timed part, the way
+                // SQLite's side builds it, so neither engine is handed a
+                // string the other had to make.
+                let t0 = Instant::now();
+                let row = vec![
+                    Value::Int(i as i64),
+                    Value::Real(i as f64 * 1.5),
+                    Value::Text(format!("row {i}")),
+                ];
+                t.insert(i as i64, row).expect("insert");
+                each.push(t0.elapsed().as_nanos() as u64);
+            }
+            self.rows = rows;
+            each
+        }
+
+        fn reads(&mut self, ops: u64, rng: &mut Rng) -> Vec<u64> {
+            let mut each = Vec::with_capacity(ops as usize);
+            let t = self.db.table(self.kv);
+            let rows = self.rows;
+            for _ in 0..ops {
+                let key = rng.below(rows) as i64;
+                let t0 = Instant::now();
+                let got = t.get_at(key, 0).and_then(|v| v.as_int()).expect("select");
+                each.push(t0.elapsed().as_nanos() as u64);
+                debug_assert_eq!(got, key);
+            }
+            each
+        }
+
+        fn mixed(&mut self, ops: u64, writes: u64, rng: &mut Rng) -> Vec<u64> {
+            let mut each = Vec::with_capacity(ops as usize);
+            let rows = self.rows;
+            for _ in 0..ops {
+                let key = rng.below(rows) as i64;
+                let write = rng.below(1000) < writes;
+                let t0 = Instant::now();
+                if write {
+                    self.db
+                        .table_mut(self.kv)
+                        .update(key, 0, Value::Int(key + 1))
+                        .expect("update");
+                } else {
+                    let _ = self.db.table(self.kv).get_at(key, 0).expect("select");
+                }
+                each.push(t0.elapsed().as_nanos() as u64);
+            }
+            each
+        }
+    }
+}
 
 // ── The fsync floor ────────────────────────────────────────────────────
 
@@ -414,7 +492,31 @@ fn main() {
         }
     }
 
-    println!("\nferrite has no engine yet. Phase 1 puts one beside these rows.");
+    // ferrite, phase 1: no log and no fsync yet, so there is one set of
+    // numbers rather than one per durability mode.
+    let mut collected: Vec<Vec<Run>> = Vec::new();
+    let mut title = String::new();
+    for go in 0..goes {
+        let mut db = engine::Ferrite::open();
+        if go == 0 { title = db.name(); }
+        let mut rng = Rng::new(0x5EED_1234 + go as u64);
+        collected.push(vec![
+            measure(&mut db, "bulk insert", |e| e.load(ROWS)),
+            measure(&mut db, "all reads", |e| e.reads(READ_OPS, &mut Rng::new(1 + go as u64))),
+            measure(&mut db, "95/5 read-update", |e| e.mixed(MIXED_OPS, 50, &mut rng)),
+            measure(&mut db, "50/50 read-update", |e| e.mixed(MIXED_OPS, 500, &mut rng)),
+        ]);
+    }
+    let mut middling = Vec::new();
+    for i in 0..4 {
+        let per_workload: Vec<Run> = collected.iter_mut().map(|g| std::mem::replace(
+            &mut g[i],
+            Run { what: "", ops: 0, wall_ns: 1, cpu_ns: 0, each: Vec::new() },
+        )).collect();
+        middling.push(median_run(per_workload).0);
+    }
+    table(&title, &mut middling);
+    println!("\nDurability is phase 3. These rows promise nothing about a power cut.");
 }
 
 #[cfg(not(feature = "bench"))]
