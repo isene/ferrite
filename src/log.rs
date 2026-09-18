@@ -40,6 +40,14 @@ impl Default for Durability {
 /// How big the log gets before the whole database is written out fresh.
 pub const SNAPSHOT_AT: u64 = 4 << 20;
 
+/// The first claim, and the biggest one.
+///
+/// Claiming a megabyte before the first commit makes opening a small
+/// database cost a megabyte of writing, which is silly for a database
+/// that holds ten rows. So the claim starts small and doubles, and a
+/// database that keeps going settles at the large size.
+const FIRST_CLAIM: u64 = 64 << 10;
+
 /// How much log file is claimed at a time.
 ///
 /// An append that makes a file longer changes the file's size, and on
@@ -48,6 +56,14 @@ pub const SNAPSHOT_AT: u64 = 4 << 20;
 /// ahead of time and writing inside it keeps the size unchanged, so an
 /// fsync only has the data to write.
 const CLAIM: u64 = 1 << 20;
+
+/// A record this big or bigger is written straight out.
+///
+/// Claiming space costs a write of zeros the same size as the space, and
+/// that only pays when many small commits would each have lengthened the
+/// file. One big record lengthens it once, so the bookkeeping is spread
+/// over megabytes and claiming ahead would only write everything twice.
+const BIG: u64 = 1 << 18;
 
 // ── Checksum ───────────────────────────────────────────────────────────
 
@@ -354,6 +370,12 @@ pub struct Store {
     /// How long the file is, which is usually more than the log, because
     /// space is claimed ahead of the writing.
     claimed: u64,
+    /// How much to claim next time, doubling towards `CLAIM`.
+    claim_size: u64,
+    /// Changes written since the last snapshot. A snapshot is only worth
+    /// taking when the log holds a good deal more than the database
+    /// does, which is what this counts towards.
+    records: u64,
     pub durability: Durability,
     /// True when something has been written but not forced to the disk.
     unsynced: bool,
@@ -395,6 +417,7 @@ impl Store {
         log.read_to_end(&mut bytes).map_err(io)?;
         let (mut found, good) = decode_all(&bytes);
         commits.append(&mut found);
+        let counted = commits.iter().map(|c| c.len() as u64).sum();
         if good as u64 != bytes.len() as u64 {
             // Cut the half-written tail a crash left behind.
             log.set_len(good as u64).map_err(io)?;
@@ -408,6 +431,8 @@ impl Store {
                 log,
                 log_len: good as u64,
                 claimed: good as u64,
+                claim_size: FIRST_CLAIM,
+                records: counted,
                 durability,
                 unsynced: false,
             },
@@ -421,19 +446,24 @@ impl Store {
     pub fn commit(&mut self, changes: &[Change]) -> Result<()> {
         if changes.is_empty() { return Ok(()); }
         let bytes = encode(changes);
+        self.records += changes.len() as u64;
         self.write(&bytes)
     }
 
     /// Write a commit that has already been built up byte by byte.
-    pub fn commit_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+    pub fn commit_bytes(&mut self, bytes: &[u8], count: u32) -> Result<()> {
         if bytes.is_empty() { return Ok(()); }
+        self.records += count as u64;
         self.write(bytes)
     }
 
     fn write(&mut self, bytes: &[u8]) -> Result<()> {
-        self.claim(bytes.len() as u64)?;
+        let len = bytes.len() as u64;
+        if len < BIG { self.claim(len)?; }
         self.log.write_all(bytes).map_err(io)?;
-        self.log_len += bytes.len() as u64;
+        self.log_len += len;
+        // A big record put its own blocks down as it was written.
+        self.claimed = self.claimed.max(self.log_len);
         match self.durability {
             Durability::Full => { self.log.sync_data().map_err(io)?; self.unsynced = false; }
             Durability::Normal => self.unsynced = true,
@@ -445,7 +475,8 @@ impl Store {
     /// to grow while a commit is being written.
     fn claim(&mut self, more: u64) -> Result<()> {
         if self.log_len + more <= self.claimed { return Ok(()); }
-        let want = (self.log_len + more).max(self.claimed + CLAIM);
+        let want = (self.log_len + more).max(self.claimed + self.claim_size);
+        self.claim_size = (self.claim_size * 2).min(CLAIM);
         let here = self.log.stream_position().map_err(io)?;
         // Real zeros, not a shorter file made longer. Making a file
         // longer leaves the new part unwritten, and the first write into
@@ -460,9 +491,17 @@ impl Store {
         Ok(())
     }
 
-    /// True when the log has grown enough to be worth replacing with a
-    /// fresh snapshot. Asked after a commit, never on a clock.
-    pub fn wants_snapshot(&self) -> bool { self.log_len >= SNAPSHOT_AT }
+    /// True when writing the database out fresh would make the log
+    /// shorter. Asked after a commit, never on a clock.
+    ///
+    /// Size alone is the wrong question. A hundred thousand rows loaded
+    /// once fill the log with one record each, and a snapshot of them
+    /// would be the same size, so it would write everything twice for
+    /// nothing. What makes a snapshot pay is records the database no
+    /// longer needs: rows written over, rows deleted.
+    pub fn wants_snapshot(&self, live_rows: u64) -> bool {
+        self.log_len >= SNAPSHOT_AT && self.records > 2 * live_rows.max(1)
+    }
 
     pub fn log_len(&self) -> u64 { self.log_len }
 
@@ -497,6 +536,8 @@ impl Store {
         self.log.sync_data().map_err(io)?;
         self.log_len = 0;
         self.claimed = 0;
+        self.claim_size = FIRST_CLAIM;
+        self.records = 0;
         self.unsynced = false;
         Ok(())
     }
@@ -654,6 +695,24 @@ mod tests {
         // And the file is now the length of the good part, so the next
         // commit lands on clean ground.
         assert_eq!(store.log_len(), std::fs::metadata(Store::log_path(&dir)).unwrap().len());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_snapshot_waits_for_something_to_compact() {
+        let dir = std::env::temp_dir().join(format!("ferrite-wants-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let (mut store, _) = Store::open(&dir, Durability::Normal).unwrap();
+        // One record a row is nothing to compact, however big it gets.
+        store.records = 100_000;
+        store.log_len = SNAPSHOT_AT + 1;
+        assert!(!store.wants_snapshot(100_000));
+        // Three records a row is mostly dead weight.
+        store.records = 300_000;
+        assert!(store.wants_snapshot(100_000));
+        // And a short log is left alone whatever is in it.
+        store.log_len = 10;
+        assert!(!store.wants_snapshot(1));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

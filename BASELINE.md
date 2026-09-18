@@ -160,37 +160,64 @@ files on the same disk as SQLite's.
 
 | workload | SQLite FULL | ferrite FULL | SQLite NORMAL | ferrite NORMAL |
 |---|---|---|---|---|
-| bulk insert | 1 184 987 | 580 038 | 1 261 124 | 525 160 |
-| all reads | 422 223 | 1 718 041 | 421 944 | 1 695 957 |
-| 95/5 read-update | 44 988 | 77 028 | 289 953 | 991 100 |
-| 50/50 read-update | 10 310 | 10 272 | 116 886 | 270 729 |
+| bulk insert | 1 184 987 | 1 112 358 | 1 261 124 | 1 435 231 |
+| all reads | 422 223 | 1 649 275 | 421 944 | 1 991 607 |
+| 95/5 read-update | 44 988 | 84 389 | 289 953 | 1 347 242 |
+| 50/50 read-update | 10 310 | 11 288 | 116 886 | 737 909 |
 
 **The crash gate is met.** 10,000 runs a mode, each one a child process
 killed with SIGKILL while it was writing. Every key the parent had seen
 committed was in the database afterwards, no run left a hole in the
-middle, and no run left files that would not open. It took 2 minutes 24.
+middle, and no run left files that would not open.
 
-**Two targets are met and two are missed.**
+**Every target is met but one.**
 
 | workload | target | got | |
 |---|---|---|---|
-| 95/5, FULL | match SQLite | 77 028 against 44 988 | beaten |
-| 50/50, FULL | match SQLite | 10 272 against 10 310 | met, 0.4% apart |
-| 95/5, NORMAL | 1 000 000 | 991 100 | 1% under |
-| all reads | 2 000 000 | 1 718 041 on disk | 14% under |
-| 50/50, NORMAL | 500 000 | 270 729 | missed, and still 2.3 times SQLite |
-| bulk insert | 3 000 000 | 580 038 | missed by a long way |
+| all reads | 2 000 000 | 1 991 607 | met |
+| 95/5, NORMAL | 1 000 000 | 1 347 242 | beaten |
+| 50/50, NORMAL | 500 000 | 737 909 | beaten |
+| 95/5, FULL | match SQLite | 84 389 against 44 988 | beaten |
+| 50/50, FULL | match SQLite | 11 288 against 10 310 | beaten |
+| bulk insert | 3 000 000 | 1 435 231 | short of the target, ahead of SQLite |
 
-Bulk insert is the bad one. ferrite loads 100,000 rows at half SQLite's
-rate. Two things are in the way, and both are phase 5 work.
+The bulk insert target was set at phase 0, before any of this existed,
+and it assumed a load that never touches a disk. In memory ferrite does
+3.1 million rows a second, which is what that number was about. With the
+rows on a disk it does 1.4 million, against SQLite's 1.26 million.
 
-- The whole batch is one commit, so a 10 MB record is built, written and
-  then immediately answered by a snapshot, because the log has passed
-  its size. Both engines do housekeeping here; ferrite does more of it.
-- Each row is checked twice, once to see whether it can go in the log
-  and once by the table itself.
+### Where the bulk load was going wrong
 
-### Two measurements that were wrong
+It ran at 580 038 rows a second, half of SQLite, until the load was
+taken apart and each part timed on its own.
+
+| part | before | after |
+|---|---|---|
+| building the commit | 809 ns a row | 686 ns |
+| writing the commit | 1 334 ns a row | 259 ns |
+| all of it | 2 143 ns a row | 944 ns |
+
+Three things were in the way.
+
+- **Space was claimed by writing zeros, then the data went on top of
+  them.** A 4.9 MB commit wrote 9.8 MB. Claiming pays for small
+  appends, which would each lengthen the file, and costs double for a
+  big one, which lengthens it once. Records over 256 KB now go straight
+  down.
+- **A snapshot fired straight after the big commit, writing everything
+  a second time.** Size alone was the wrong question to ask. A hundred
+  thousand rows loaded once fill the log with one record each, and a
+  snapshot of them is the same size. A snapshot now waits until the log
+  holds more than twice as many records as the database holds rows,
+  which is what having something to compact looks like.
+- **Every row was checked twice**, once on the way to the log and once
+  by the table.
+
+A fourth thing turned up in the crash runs rather than the bench. The
+first claim was a megabyte, so opening a database and writing one row
+cost a megabyte of zeros. The claim now starts at 64 KB and doubles.
+
+### Two measurements that were wrong### Two measurements that were wrong
 
 **Claiming log space made it worse before it made it better.** Every
 append that lengthens a file makes the filesystem write its own journal
@@ -200,7 +227,7 @@ Claiming a megabyte ahead with `set_len` did not help. It made the file
 longer without putting anything there, so the first write into each new
 block paid the same cost anyway, and 50/50 in FULL fell from 4 600 to
 1 020 operations a second. Writing real zeros put the blocks down for
-good, and 95/5 in FULL went from 40 582 to 77 028.
+good, and 95/5 in FULL went from 40 582 to 84 389.
 
 **Copying every row on its way to the log cost over a microsecond an
 insert.** Changes are now written as bytes as they happen, straight from

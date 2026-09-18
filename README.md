@@ -20,9 +20,9 @@ Both were killed with SIGKILL 10,000 times mid-write. Neither lost a
 committed row and neither left a file that would not open.
 
 It speaks CREATE TABLE, INSERT, SELECT, UPDATE, DELETE, WHERE, LIMIT,
-COUNT and transactions. Point reads run at about 2 million a second
-against SQLite's 422 thousand, and a prepared lookup costs no more than
-calling the engine directly.
+COUNT and transactions. With its files on the same disk as SQLite's, it
+reads about 2 million rows a second against SQLite's 422 thousand, and
+does 738 thousand mixed operations against SQLite's 117 thousand.
 
 60,000 generated statements have been run on ferrite and on SQLite with
 every answer compared. Durability comes in phase 3, and the write

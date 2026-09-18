@@ -261,6 +261,11 @@ impl Table {
         self.rows.range(from..to.max(from)).map(|(k, r)| (*k, r))
     }
 
+    /// Put a row in that has already been looked over.
+    pub(crate) fn insert_known_good(&mut self, key: i64, row: Row) {
+        self.rows.insert(key, row);
+    }
+
     /// Would this row go in under this key?
     pub(crate) fn can_insert(&self, key: i64, row: &Row) -> Result<()> {
         self.check(row)?;
@@ -513,7 +518,7 @@ impl Db {
         }
         log::finish(&mut self.journal, self.journal_count);
         if let Some(s) = &mut self.store {
-            s.commit_bytes(&self.journal)?;
+            s.commit_bytes(&self.journal, self.journal_count)?;
         }
         self.journal.clear();
         self.journal_count = 0;
@@ -528,8 +533,11 @@ impl Db {
             self.tables[table.0].can_insert(key, &row)?;
             let t = table.0 as u32;
             log::put_row(self.opening(), t, key, &row);
+            // Already checked a line ago; checking again is pure cost.
+            self.tables[table.0].insert_known_good(key, row);
+        } else {
+            self.tables[table.0].insert(key, row)?;
         }
-        self.tables[table.0].insert(key, row)?;
         self.note_insert(table, key);
         self.close_if_alone()
     }
@@ -632,7 +640,8 @@ impl Db {
     }
 
     fn snapshot_if_grown(&mut self) -> Result<()> {
-        if self.store.as_ref().is_some_and(|s| s.wants_snapshot()) {
+        let live: u64 = self.tables.iter().map(|t| t.rows.len() as u64).sum();
+        if self.store.as_ref().is_some_and(|s| s.wants_snapshot(live)) {
             let all = self.everything();
             if let Some(s) = &mut self.store { s.snapshot(&all)?; }
         }
