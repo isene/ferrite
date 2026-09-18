@@ -194,3 +194,31 @@ fn opening_an_empty_directory_gives_an_empty_database() {
     assert_eq!(db.table_names().count(), 0);
     assert!(dir.path().join("log").exists());
 }
+
+#[test]
+fn a_key_handed_out_once_is_not_handed_out_again_after_a_reopen() {
+    let dir = Dir::new("nextkey");
+    {
+        let mut db = Db::open(dir.path()).unwrap();
+        db.execute_batch(
+            "CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, a INTEGER);
+             CREATE TABLE s (k TEXT PRIMARY KEY, v INTEGER DEFAULT 3, UNIQUE(v));
+             INSERT INTO t (a) VALUES (1);
+             INSERT INTO t (a) VALUES (2);
+             INSERT INTO t (a) VALUES (3);
+             DELETE FROM t WHERE id = 3;
+             INSERT INTO s (k, v) VALUES ('a', 1);",
+        )
+        .unwrap();
+        // With the deleted row gone from the files.
+        db.checkpoint().unwrap();
+    }
+    let mut db = Db::open(dir.path()).unwrap();
+    db.execute("INSERT INTO t (a) VALUES (4)", &[]).unwrap();
+    assert_eq!(db.last_insert_key(), 4, "key 3 was used once and is not used again");
+    // The unique index, the default and the hidden rowid came back too.
+    assert!(db.execute("INSERT INTO s (k, v) VALUES ('b', 1)", &[]).is_err());
+    db.execute("INSERT INTO s (k) VALUES ('b')", &[]).unwrap();
+    assert_eq!(rows_of(&db, "SELECT k, v FROM s WHERE k = 'b'"), vec![vec![Value::Text("b".into()), Value::Int(3)]]);
+    assert_eq!(rows_of(&db, "SELECT rowid FROM s WHERE k = 'b'"), vec![vec![Value::Int(2)]]);
+}

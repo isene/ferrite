@@ -116,10 +116,10 @@
           <tr><th>workload</th><th>SQLite FULL</th><th>ferrite FULL</th><th>SQLite NORMAL</th><th>ferrite NORMAL</th></tr>
         </thead>
         <tbody>
-          <tr><td>bulk insert</td><td>1 166 367</td><td class="win">1 567 386</td><td>1 261 951</td><td class="win">1 870 768</td></tr>
-          <tr><td>all reads</td><td>421 320</td><td class="win">1 584 627</td><td>424 433</td><td class="win">1 922 235</td></tr>
-          <tr><td>95 reads, 5 updates</td><td>47 612</td><td class="win">82 260</td><td>290 882</td><td class="win">1 383 413</td></tr>
-          <tr><td>50 reads, 50 updates</td><td>10 173</td><td class="win">11 325</td><td>116 955</td><td class="win">702 545</td></tr>
+          <tr><td>bulk insert</td><td>1 174 336</td><td class="win">1 755 785</td><td>1 258 940</td><td class="win">1 906 607</td></tr>
+          <tr><td>all reads</td><td>422 125</td><td class="win">1 568 619</td><td>418 930</td><td class="win">1 867 973</td></tr>
+          <tr><td>95 reads, 5 updates</td><td>46 832</td><td class="win">81 031</td><td>284 534</td><td class="win">1 357 665</td></tr>
+          <tr><td>50 reads, 50 updates</td><td>10 001</td><td class="win">10 823</td><td>112 041</td><td class="win">709 148</td></tr>
         </tbody>
       </table>
       <p class="note">
@@ -143,10 +143,10 @@
           <tr><th>asking for</th><th>SQLite</th><th>ferrite</th></tr>
         </thead>
         <tbody>
-          <tr><td>the key only</td><td>125</td><td class="win">53</td></tr>
-          <tr><td>the indexed column</td><td>122</td><td class="win">54</td></tr>
-          <tr><td>a text column, so the row is fetched</td><td>570</td><td class="win">316</td></tr>
-          <tr><td>walking the whole table, no index</td><td>3 700</td><td class="win">2 700</td></tr>
+          <tr><td>the key only</td><td>123</td><td class="win">53</td></tr>
+          <tr><td>the indexed column</td><td>121</td><td class="win">54</td></tr>
+          <tr><td>a text column, so the row is fetched</td><td>582</td><td class="win">277</td></tr>
+          <tr><td>walking the whole table, no index</td><td>3 661</td><td class="win">2 784</td></tr>
         </tbody>
       </table>
     </div>
@@ -162,14 +162,14 @@
         <tbody>
           <tr><td>Where the rows live</td><td>On disk in pages, with a cache in memory</td><td>In memory. A log and a snapshot on disk</td></tr>
           <tr><td>How much it holds</td><td>Up to terabytes</td><td>What fits in RAM</td></tr>
-          <tr><td>SQL</td><td>The whole language. Views, triggers, subqueries, window functions.</td><td>The core. Tables, indexes, one inner join, ORDER BY, LIMIT, the four aggregates, transactions.</td></tr>
+          <tr><td>SQL</td><td>The whole language. Views, triggers, subqueries, window functions.</td><td>The core. Tables with defaults, unique and foreign keys, indexes over one column or several, one inner join, WHERE with AND, OR, NOT, IS NULL, BETWEEN and arithmetic, ORDER BY, LIMIT, the four aggregates, INSERT OR IGNORE and OR REPLACE, transactions.</td></tr>
           <tr><td>Types</td><td>Five, bent to fit the column. A string goes into an INTEGER column and stays a string.</td><td>Five, kept as declared. A string in an INTEGER column is refused.</td></tr>
           <tr><td>Durability</td><td>FULL or NORMAL; FULL by default</td><td>FULL or NORMAL; NORMAL by default, and the README says so first</td></tr>
           <tr><td>Crash safety</td><td>Decades of it</td><td>Killed mid-write 10,000 times in each mode. No committed row lost, no file that would not open</td></tr>
           <tr><td>Who can use it at once</td><td>Many readers and one writer, across processes</td><td>One thread in one process</td></tr>
           <tr><td>Answers checked against</td><td>Its own test suite</td><td>SQLite: tens of thousands of generated statements, in memory and on disk, every answer compared</td></tr>
           <tr><td>Dependencies</td><td>None</td><td>None</td></tr>
-          <tr><td>Size</td><td>Around a quarter of a million lines of C</td><td>About 5,600 lines of Rust, bench and tests included</td></tr>
+          <tr><td>Size</td><td>Around a quarter of a million lines of C</td><td>About 7,900 lines of Rust, bench and tests included</td></tr>
           <tr><td>Age</td><td>Twenty-five years</td><td>Weeks</td></tr>
           <tr><td>License</td><td>Public domain</td><td>Public domain</td></tr>
         </tbody>

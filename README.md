@@ -32,32 +32,46 @@ ext4 on NVMe, SQLite 3.46 with WAL and prepared statements.
 
 | workload | SQLite FULL | ferrite FULL | SQLite NORMAL | ferrite NORMAL |
 |---|---:|---:|---:|---:|
-| bulk insert | 1 166 367 | **1 567 386** | 1 261 951 | **1 870 768** |
-| all reads | 421 320 | **1 584 627** | 424 433 | **1 922 235** |
-| 95 reads, 5 updates | 47 612 | **82 260** | 290 882 | **1 383 413** |
-| 50 reads, 50 updates | 10 173 | **11 325** | 116 955 | **702 545** |
+| bulk insert | 1 174 336 | **1 755 785** | 1 258 940 | **1 906 607** |
+| all reads | 422 125 | **1 568 619** | 418 930 | **1 867 973** |
+| 95 reads, 5 updates | 46 832 | **81 031** | 284 534 | **1 357 665** |
+| 50 reads, 50 updates | 10 001 | **10 823** | 112 041 | **709 148** |
 
 One lookup through an index on a column that is not the key, about a
 thousand rows matching, in microseconds:
 
 | asking for | SQLite | ferrite |
 |---|---:|---:|
-| the key only | 125 | **53** |
-| the indexed column | 122 | **54** |
-| a text column, so the row is fetched | 570 | **316** |
-| walking the whole table, no index | 3 700 | **2 700** |
+| the key only | 123 | **53** |
+| the indexed column | 121 | **54** |
+| a text column, so the row is fetched | 582 | **277** |
+| walking the whole table, no index | 3 661 | **2 784** |
 
 Every number, and how it was measured, is in [BASELINE.md](BASELINE.md).
 Nothing merges that is slower than what it replaces.
 
 ## What it speaks
 
-CREATE TABLE, CREATE INDEX, INSERT, SELECT, UPDATE, DELETE, WHERE, one
-inner join, ORDER BY, LIMIT, COUNT, SUM, MIN, MAX and transactions.
+CREATE TABLE with defaults, NOT NULL, UNIQUE, a primary key of any type
+or over several columns, and foreign keys with ON DELETE CASCADE.
+CREATE INDEX, unique or not, over one column or several. INSERT, also
+OR IGNORE and OR REPLACE. UPDATE, DELETE and transactions.
+
+SELECT with one inner join, table aliases, WHERE with AND, OR, NOT,
+IS NULL, BETWEEN, COALESCE and arithmetic, ORDER BY, LIMIT, COUNT, SUM,
+MIN and MAX. PRAGMA is read and ignored.
+
 Five types, kept as declared: a string in an INTEGER column is refused.
+Foreign keys are always checked; there is no switch to turn them off.
+A key handed out by an insert is never handed out again.
 
 Tens of thousands of generated statements have been run on ferrite and
-on SQLite, in memory and on disk, with every answer compared.
+on SQLite, in memory and on disk, with every answer compared, and every
+table compared after every statement that was refused.
+
+The first program on it is [tock](https://github.com/isene/tock), the
+calendar: `database: ferrite` in its config copies its SQLite file in
+once and runs on ferrite from then on.
 
 ## Using it
 

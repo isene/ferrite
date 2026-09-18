@@ -17,7 +17,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
-use crate::{Column, Error, Kind, Result, Row, Value};
+use crate::{Column, Error, ForeignKey, Kind, Result, Row, TableId, Value};
 
 /// How hard a commit tries to survive.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,7 +143,7 @@ unsafe fn by_instruction(bytes: &[u8]) -> u32 {
 /// replaying is the same work whatever made the change.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Change {
-    NewTable { name: String, key: String, columns: Vec<Column> },
+    NewTable { name: String, key: String, columns: Vec<Column>, foreign_keys: Vec<ForeignKey> },
     Put { table: u32, key: i64, row: Row },
     /// One column of one row. Cheaper to write than the whole row, which
     /// matters because an update is the commonest change there is.
@@ -152,13 +152,19 @@ pub enum Change {
     DropTable { name: String },
     /// An index is only its definition. What is in it can be worked out
     /// again from the rows, so none of that goes to the log.
-    NewIndex { name: String, table: u32, column: String },
+    NewIndex { name: String, table: u32, columns: Vec<String>, unique: bool },
     DropIndex { name: String },
+    /// The key the table's next insert without one will get. Only a
+    /// snapshot writes this: in the log, the inserts themselves say it.
+    Next { table: u32, key: i64 },
 }
 
 impl PartialEq for Column {
     fn eq(&self, other: &Self) -> bool {
-        self.name == other.name && self.kind == other.kind && self.null_ok == other.null_ok
+        self.name == other.name
+            && self.kind == other.kind
+            && self.null_ok == other.null_ok
+            && self.default == other.default
     }
 }
 
@@ -188,7 +194,7 @@ fn put_value(out: &mut Vec<u8>, v: &Value) {
 
 fn put_change(out: &mut Vec<u8>, c: &Change) {
     match c {
-        Change::NewTable { name, key, columns } => {
+        Change::NewTable { name, key, columns, foreign_keys } => {
             out.push(1);
             put_str(out, name);
             put_str(out, key);
@@ -202,6 +208,13 @@ fn put_change(out: &mut Vec<u8>, c: &Change) {
                     Kind::Blob => 4,
                 });
                 out.push(col.null_ok as u8);
+                put_value(out, &col.default);
+            }
+            put_u32(out, foreign_keys.len() as u32);
+            for fk in foreign_keys {
+                put_u32(out, fk.column as u32);
+                put_u32(out, fk.parent.0 as u32);
+                out.push(fk.cascade as u8);
             }
         }
         Change::Put { table, key, row } => {
@@ -227,15 +240,22 @@ fn put_change(out: &mut Vec<u8>, c: &Change) {
             out.push(4);
             put_str(out, name);
         }
-        Change::NewIndex { name, table, column } => {
+        Change::NewIndex { name, table, columns, unique } => {
             out.push(6);
             put_str(out, name);
             put_u32(out, *table);
-            put_str(out, column);
+            put_u32(out, columns.len() as u32);
+            for c in columns { put_str(out, c); }
+            out.push(*unique as u8);
         }
         Change::DropIndex { name } => {
             out.push(7);
             put_str(out, name);
+        }
+        Change::Next { table, key } => {
+            out.push(8);
+            put_u32(out, *table);
+            put_i64(out, *key);
         }
     }
 }
@@ -356,9 +376,18 @@ impl<'a> Reader<'a> {
                         _ => return None,
                     };
                     let null_ok = self.u8()? != 0;
-                    columns.push(Column { name: cname, kind, null_ok });
+                    let default = self.value()?;
+                    columns.push(Column { name: cname, kind, null_ok, default });
                 }
-                Change::NewTable { name, key, columns }
+                let n = self.u32()? as usize;
+                let mut foreign_keys = Vec::with_capacity(n);
+                for _ in 0..n {
+                    let column = self.u32()? as usize;
+                    let parent = TableId(self.u32()? as usize);
+                    let cascade = self.u8()? != 0;
+                    foreign_keys.push(ForeignKey { column, parent, cascade });
+                }
+                Change::NewTable { name, key, columns, foreign_keys }
             }
             2 => {
                 let table = self.u32()?;
@@ -376,12 +405,17 @@ impl<'a> Reader<'a> {
                 value: self.value()?,
             },
             4 => Change::DropTable { name: self.string()? },
-            6 => Change::NewIndex {
-                name: self.string()?,
-                table: self.u32()?,
-                column: self.string()?,
-            },
+            6 => {
+                let name = self.string()?;
+                let table = self.u32()?;
+                let n = self.u32()? as usize;
+                let mut columns = Vec::with_capacity(n);
+                for _ in 0..n { columns.push(self.string()?); }
+                let unique = self.u8()? != 0;
+                Change::NewIndex { name, table, columns, unique }
+            }
             7 => Change::DropIndex { name: self.string()? },
+            8 => Change::Next { table: self.u32()?, key: self.i64()? },
             _ => return None,
         })
     }
@@ -620,9 +654,10 @@ mod tests {
                 name: "kv".into(),
                 key: "id".into(),
                 columns: vec![
-                    Column { name: "a".into(), kind: Kind::Int, null_ok: true },
-                    Column { name: "c".into(), kind: Kind::Text, null_ok: false },
+                    Column { name: "a".into(), kind: Kind::Int, null_ok: true, default: Value::Null },
+                    Column { name: "c".into(), kind: Kind::Text, null_ok: false, default: Value::Text("x".into()) },
                 ],
+                foreign_keys: vec![ForeignKey { column: 0, parent: TableId(0), cascade: true }],
             },
             Change::Put {
                 table: 0,
@@ -638,8 +673,10 @@ mod tests {
             Change::Set { table: 0, key: 8, col: 0, value: Value::Int(4) },
             Change::Delete { table: 0, key: 7 },
             Change::DropTable { name: "old".into() },
-            Change::NewIndex { name: "kv_a".into(), table: 0, column: "a".into() },
+            Change::NewIndex { name: "kv_a".into(), table: 0, columns: vec!["a".into()], unique: false },
+            Change::NewIndex { name: "kv_ac".into(), table: 0, columns: vec!["a".into(), "c".into()], unique: true },
             Change::DropIndex { name: "kv_a".into() },
+            Change::Next { table: 0, key: 10 },
         ]
     }
 

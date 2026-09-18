@@ -353,6 +353,105 @@ no more than the direct call.
 The adaptive radix tree in the plan. Point reads are five times SQLite,
 and no measurement is asking for more.
 
+## Phase 6: the first real user
+
+tock, the calendar, chosen by the user. Its `database.rs` is 700 lines
+of SQL against SQLite, and ferrite lacked most of what it uses. Every
+gap was closed in ferrite rather than worked around in tock, and the
+random SQL now covers each of them.
+
+### What tock needed
+
+- A key left out of an INSERT, and `last_insert_rowid`. Every table now
+  files its rows under an integer key; an INTEGER PRIMARY KEY column is
+  that key, and any other table has a hidden `rowid`. A key handed out
+  once is never handed out again, and a snapshot writes the next one
+  down so a reopen does not start over.
+- TEXT and two-column primary keys, UNIQUE columns and unique indexes,
+  all one thing: a unique index over stored columns. Null never clashes.
+- Indexes over several columns. An index is used when every one of its
+  columns has an `=` in the WHERE, whatever order they were written in.
+- DEFAULT values, INSERT OR IGNORE and INSERT OR REPLACE.
+- FOREIGN KEY with ON DELETE CASCADE. A row pointing at nothing is
+  refused; deleting a row takes the rows pointing at it along, or is
+  refused when their key does not cascade. Always on: there is no
+  pragma to turn it off.
+- WHERE with OR, NOT, IS NULL, BETWEEN, COALESCE, brackets and
+  arithmetic; `SET enabled = 1 - enabled`; `COUNT(*) > 0`; table
+  aliases; a batch of statements; PRAGMA, read and ignored.
+- A statement that fails halfway changes nothing. A multi-row UPDATE
+  that hits a unique clash on its third row puts the first two back,
+  inside a transaction or not, the way SQLite does.
+
+### The random SQL grew with it
+
+Four tables now: the two from before, one with a text key and a unique
+column, one with a key over two columns and a default. The second table
+points at the first with a cascade, and SQLite runs with foreign keys
+on. Every table is compared after every statement either engine
+refused, and the key handed out by an insert without one is compared
+too. 15 seeds, in memory and on disk with reopens, all in step.
+
+### A regression, caught by the bench
+
+The first build of this phase was slower on three rows, and the old
+build run back to back showed it was real, not noise:
+
+| | old build | first build | what it was |
+|---|---|---|---|
+| NORMAL all reads | 1 920 452 | 1 602 241 | the select list went through a general evaluator |
+| NORMAL 50/50 | 716 768 | 627 109 | every UPDATE fetched the row and built a Vec, in case a value needed it |
+| walking, no index | 2 635 µs | 2 850 µs | the row filter stopped inlining once it could hold any expression |
+| a string, through an index | 254 µs | 338 µs | the same evaluator, per row |
+
+The fix is to keep the plain shapes plain: a select list of columns is
+a list of picks, a WHERE of `column = value` tests is a list of tests,
+and an UPDATE fetches the row only when a new value is worked out from
+it. The general evaluator is there for everything else and costs
+nothing when it is not used.
+
+### The crash harness, again
+
+Every write path changed, so 10,000 SIGKILLs a mode again: none lost a
+committed row, none broke the files. FULL 106 s, NORMAL 115 s.
+
+### tock on ferrite
+
+`database: ferrite` in tock's config. The first start copies the SQLite
+file in, table by table inside one transaction, bending each value to
+its declared kind on the way. The user's own database, 8 calendars and
+503 events, came across in 31 ms and read back the same through both
+engines, field by field. tock keeps SQLite as its default until the
+user flips it.
+
+Two things SQLite lets through that ferrite does not, both met in tock:
+a string in an INTEGER column ("00" for an hour, now written as 0), and
+`SELECT *` on a table whose key is not its first column, which ferrite
+answers with the key first.
+
+### Where it stands after phase 6
+
+Median of five, and the old build run straight after it landed inside
+the same spread on every row.
+
+| workload | SQLite FULL | ferrite FULL | SQLite NORMAL | ferrite NORMAL |
+|---|---|---|---|---|
+| bulk insert | 1 174 336 | 1 755 785 | 1 258 940 | 1 906 607 |
+| all reads | 422 125 | 1 568 619 | 418 930 | 1 867 973 |
+| 95/5 read-update | 46 832 | 81 031 | 284 534 | 1 357 665 |
+| 50/50 read-update | 10 001 | 10 823 | 112 041 | 709 148 |
+
+| asking for, through an index | ferrite | SQLite |
+|---|---|---|
+| the key only | 53 µs | 123 µs |
+| the indexed column | 54 µs | 121 µs |
+| a text column | 277 µs | 582 µs |
+| walking the whole table, no index | 2 784 µs | 3 661 µs |
+
+The machine drifts about ten percent between runs of the same binary,
+which is why a regression is only believed when the old build is run
+right after the new one.
+
 ## A trap this bench fell into
 
 The first run reported a 3 µs fsync and near-identical FULL and NORMAL

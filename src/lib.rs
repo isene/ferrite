@@ -1,8 +1,8 @@
 //! ferrite: an embedded SQL database that keeps its tables in memory.
 //!
-//! A table holds its rows in a B-tree map under an integer primary key,
-//! and the API is plain Rust calls. SQL compiles down to exactly those
-//! calls, so whatever they cost is the floor for everything above.
+//! A table holds its rows in a B-tree map under an integer key, and the
+//! API is plain Rust calls. SQL compiles down to exactly those calls, so
+//! whatever they cost is the floor for everything above.
 //!
 //! [`Db::new`] keeps everything in memory and forgets it when the
 //! program ends. [`Db::open`] keeps it in a directory, and **defaults to
@@ -180,6 +180,11 @@ pub enum Error {
     IndexExists(String),
     /// No index by that name.
     NoIndex(String),
+    /// A row with the same value in a unique index is already here.
+    Unique(String),
+    /// A foreign key points at a row that is not there, or a row that
+    /// others still point at was to be deleted.
+    ForeignKey(String),
 }
 
 impl std::fmt::Display for Error {
@@ -201,6 +206,8 @@ impl std::fmt::Display for Error {
             Error::Disk(s) => write!(f, "the database files: {s}"),
             Error::IndexExists(n) => write!(f, "there is already an index called {n}"),
             Error::NoIndex(n) => write!(f, "there is no index called {n}"),
+            Error::Unique(n) => write!(f, "a row with the same {n} is already there"),
+            Error::ForeignKey(s) => write!(f, "{s}"),
         }
     }
 }
@@ -216,13 +223,25 @@ pub struct Column {
     pub name: String,
     pub kind: Kind,
     pub null_ok: bool,
+    /// What an insert that does not name this column puts in it.
+    pub default: Value,
 }
 
-/// A row is its values in column order. The primary key is not among
-/// them: it is the key the row is filed under.
+/// A row is its values in column order. The key is not among them: it
+/// is what the row is filed under.
 pub type Row = Vec<Value>;
 
-/// One table, with its rows under an integer primary key.
+/// A column of this table that holds the key of a row in another. The
+/// row here can only point at a row that is there, and when `cascade`
+/// is set it goes when that row goes.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForeignKey {
+    pub column: usize,
+    pub parent: TableId,
+    pub cascade: bool,
+}
+
+/// One table, with its rows under an integer key.
 ///
 /// The rows sit in one vector, the slab, and the key tree maps a key to
 /// a slot in it. An index does the same, so a row found through an index
@@ -235,8 +254,9 @@ pub struct Table {
     /// True once the table has been thrown away. The slot stays, because
     /// the log names tables by their number.
     dropped: bool,
-    /// What the primary key is called in SQL. The key is not stored in
-    /// the row; it is what the row is filed under.
+    /// What the key is called in SQL: the INTEGER PRIMARY KEY column
+    /// when there is one, else `rowid`. The key is not stored in the
+    /// row; it is what the row is filed under.
     key: String,
     columns: Vec<Column>,
     /// Key to slot.
@@ -248,12 +268,24 @@ pub struct Table {
     /// Which indexes have to be kept up as rows change. Empty is the
     /// usual case, and one test of that keeps the cost off the hot path.
     watchers: Vec<usize>,
+    /// The key an insert gets when it gives none: one past the biggest
+    /// ever used while this table has been open.
+    next: i64,
+    foreign_keys: Vec<ForeignKey>,
+    /// Tables with a foreign key pointing here, which a delete has to
+    /// look at. Empty for most tables, and one test of that is the
+    /// whole cost.
+    children: Vec<usize>,
 }
 
 impl Table {
     pub fn name(&self) -> &str { &self.name }
     pub fn key_name(&self) -> &str { &self.key }
     pub fn columns(&self) -> &[Column] { &self.columns }
+    pub fn foreign_keys(&self) -> &[ForeignKey] { &self.foreign_keys }
+    /// True when another table's foreign key points here, so a delete
+    /// can reach into it.
+    pub fn is_pointed_at(&self) -> bool { !self.children.is_empty() }
     pub fn len(&self) -> usize { self.rows.len() }
     pub fn is_empty(&self) -> bool { self.rows.is_empty() }
 
@@ -286,6 +318,14 @@ impl Table {
     #[inline]
     pub(crate) fn slot_of(&self, key: i64) -> Option<u32> { self.rows.get(&key).copied() }
 
+    /// The key the next insert gets when it gives none.
+    pub fn next_key(&self) -> i64 { self.next.max(1) }
+
+    #[inline]
+    fn bump(&mut self, key: i64) {
+        if key >= self.next { self.next = key.saturating_add(1); }
+    }
+
     fn alloc(&mut self, row: Row) -> u32 {
         match self.free.pop() {
             Some(slot) => {
@@ -302,6 +342,7 @@ impl Table {
     /// Put a row under a key with no checking at all: for undoing and
     /// for replaying the log, where the row has been checked before.
     pub(crate) fn place(&mut self, key: i64, row: Row) -> Option<Row> {
+        self.bump(key);
         if let Some(&slot) = self.rows.get(&key) {
             return self.slab[slot as usize].replace(row);
         }
@@ -335,8 +376,7 @@ impl Table {
         if self.rows.contains_key(&key) {
             return Err(Error::KeyExists(key));
         }
-        let slot = self.alloc(row);
-        self.rows.insert(key, slot);
+        self.insert_known_good(key, row);
         Ok(())
     }
 
@@ -386,6 +426,7 @@ impl Table {
 
     /// Put a row in that has already been looked over.
     pub(crate) fn insert_known_good(&mut self, key: i64, row: Row) {
+        self.bump(key);
         let slot = self.alloc(row);
         self.rows.insert(key, slot);
     }
@@ -441,31 +482,62 @@ impl Table {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexId(usize);
 
-/// One column of one table, with every row that holds each value.
+/// What an index files a row under: the value of one column, or the
+/// values of several. One index uses one shape throughout, so the two
+/// never meet in a comparison.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum IndexKey {
+    One(SortKey),
+    Many(Vec<SortKey>),
+}
+
+impl IndexKey {
+    /// True when any part is null. Null is equal to nothing, so a row
+    /// with one cannot clash with another in a unique index.
+    fn has_null(&self) -> bool {
+        match self {
+            IndexKey::One(k) => k.0 == Value::Null,
+            IndexKey::Many(ks) => ks.iter().any(|k| k.0 == Value::Null),
+        }
+    }
+}
+
+/// One or more columns of one table, with every row that holds each
+/// value.
 ///
-/// Each entry keeps the row's own value beside its key, not only the
-/// value the entry is filed under. Those two can differ: 5 and 5.0 are
-/// equal in SQL, so they share an entry, and only the row knows which of
-/// them it holds. Keeping it here is what lets a query asking for this
-/// column be answered without fetching the row at all.
+/// A single-column index keeps the row's own value beside its key, not
+/// only the value the entry is filed under. Those two can differ: 5 and
+/// 5.0 are equal in SQL, so they share an entry, and only the row knows
+/// which of them it holds. Keeping it here is what lets a query asking
+/// for this column be answered without fetching the row at all.
 #[derive(Debug, Clone)]
 pub struct Index {
     name: String,
     table: TableId,
-    column: usize,
-    entries: BTreeMap<SortKey, BTreeMap<i64, (u32, Value)>>,
+    columns: Vec<usize>,
+    unique: bool,
+    entries: BTreeMap<IndexKey, BTreeMap<i64, (u32, Value)>>,
     dropped: bool,
 }
 
 impl Index {
     pub fn name(&self) -> &str { &self.name }
     pub fn table(&self) -> TableId { self.table }
-    pub fn column(&self) -> usize { self.column }
+    pub fn columns(&self) -> &[usize] { &self.columns }
+    /// The column, for an index on one.
+    pub fn column(&self) -> usize { self.columns[0] }
+    pub fn is_unique(&self) -> bool { self.unique }
 
-    /// The rows whose value in this column equals `value`, in key order,
-    /// each with its slot and the value it actually holds.
+    /// The rows whose value in this one column equals `value`, in key
+    /// order, each with its slot and the value it actually holds.
     pub fn rows_for(&self, value: &Value) -> Option<&BTreeMap<i64, (u32, Value)>> {
-        self.entries.get(&SortKey(value.clone()))
+        self.entries.get(&IndexKey::One(SortKey(value.clone())))
+    }
+
+    /// The rows whose values in the index's columns equal these, in
+    /// that order.
+    pub fn rows_for_all(&self, values: &[Value]) -> Option<&BTreeMap<i64, (u32, Value)>> {
+        self.entries.get(&Self::key_from(values))
     }
 
     /// Just the keys of those rows.
@@ -474,20 +546,48 @@ impl Index {
     }
 
     /// Every value in order, with the rows holding it.
-    pub fn iter(&self) -> impl Iterator<Item = (&Value, &BTreeMap<i64, (u32, Value)>)> {
-        self.entries.iter().map(|(k, v)| (&k.0, v))
+    pub fn iter(&self) -> impl Iterator<Item = (&IndexKey, &BTreeMap<i64, (u32, Value)>)> {
+        self.entries.iter()
     }
 
-    fn add(&mut self, value: &Value, key: i64, slot: u32) {
-        self.entries.entry(SortKey(value.clone())).or_default().insert(key, (slot, value.clone()));
-    }
-
-    fn remove(&mut self, value: &Value, key: i64) {
-        let k = SortKey(value.clone());
-        if let Some(rows) = self.entries.get_mut(&k) {
-            rows.remove(&key);
-            if rows.is_empty() { self.entries.remove(&k); }
+    fn key_from(values: &[Value]) -> IndexKey {
+        match values {
+            [one] => IndexKey::One(SortKey(one.clone())),
+            many => IndexKey::Many(many.iter().map(|v| SortKey(v.clone())).collect()),
         }
+    }
+
+    /// What this row files under.
+    fn key_of(&self, row: &Row) -> IndexKey {
+        match self.columns.as_slice() {
+            [c] => IndexKey::One(SortKey(row[*c].clone())),
+            cs => IndexKey::Many(cs.iter().map(|c| SortKey(row[*c].clone())).collect()),
+        }
+    }
+
+    /// The value kept beside the key: the row's own, for one column.
+    fn own(&self, row: &Row) -> Value {
+        match self.columns.as_slice() {
+            [c] => row[*c].clone(),
+            _ => Value::Null,
+        }
+    }
+
+    fn add(&mut self, key: IndexKey, own: Value, row_key: i64, slot: u32) {
+        self.entries.entry(key).or_default().insert(row_key, (slot, own));
+    }
+
+    fn remove(&mut self, key: &IndexKey, row_key: i64) {
+        if let Some(rows) = self.entries.get_mut(key) {
+            rows.remove(&row_key);
+            if rows.is_empty() { self.entries.remove(key); }
+        }
+    }
+
+    /// The key of a row, other than `except`, filed under this key.
+    fn clash(&self, key: &IndexKey, except: i64) -> Option<i64> {
+        if !self.unique || key.has_null() { return None; }
+        self.entries.get(key)?.keys().find(|k| **k != except).copied()
     }
 }
 
@@ -499,8 +599,8 @@ impl Index {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TableId(usize);
 
-/// Every table, in memory. Nothing here touches the disk: durability is
-/// phase 3.
+/// Every table, in memory, and the files they are kept in when there
+/// are any.
 #[derive(Debug, Default)]
 pub struct Db {
     tables: Vec<Table>,
@@ -521,6 +621,17 @@ pub struct Db {
     /// to be copied on its way to the disk.
     journal: Vec<u8>,
     journal_count: u32,
+    /// The key of the last row put in.
+    last_key: i64,
+}
+
+/// Where a statement began, for taking it back on its own.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Mark {
+    undo: usize,
+    journal: usize,
+    count: u32,
+    was_in_txn: bool,
 }
 
 /// One step backwards.
@@ -536,20 +647,37 @@ impl Db {
     pub fn new() -> Db { Db::default() }
 
     /// Make a table. Every column takes a kind and allows null; use
-    /// [`Db::create_table_full`] to forbid null.
+    /// [`Db::create_table_full`] to forbid null or set a default.
     pub fn create_table(&mut self, name: &str, columns: &[(&str, Kind)]) -> Result<TableId> {
         let columns: Vec<Column> = columns
             .iter()
-            .map(|(n, k)| Column { name: (*n).to_string(), kind: *k, null_ok: true })
+            .map(|(n, k)| Column { name: (*n).to_string(), kind: *k, null_ok: true, default: Value::Null })
             .collect();
-        self.create_table_full(name, "id", columns)
+        self.create_table_full(name, "id", columns, Vec::new())
     }
 
-    pub fn create_table_full(&mut self, name: &str, key: &str, columns: Vec<Column>) -> Result<TableId> {
+    /// Make a table, saying what its key is called, what its columns
+    /// are and which of them point at rows of other tables.
+    pub fn create_table_full(
+        &mut self,
+        name: &str,
+        key: &str,
+        columns: Vec<Column>,
+        foreign_keys: Vec<ForeignKey>,
+    ) -> Result<TableId> {
         if self.by_name.contains_key(name) {
             return Err(Error::TableExists(name.to_string()));
         }
+        for fk in &foreign_keys {
+            if fk.column >= columns.len() { return Err(Error::NoColumn(fk.column)); }
+            if fk.parent.0 >= self.tables.len() {
+                return Err(Error::NoTable(format!("table {}", fk.parent.0)));
+            }
+        }
         let id = TableId(self.tables.len());
+        for fk in &foreign_keys {
+            self.tables[fk.parent.0].children.push(id.0);
+        }
         self.tables.push(Table {
             name: name.to_string(),
             dropped: false,
@@ -559,6 +687,9 @@ impl Db {
             slab: Vec::new(),
             free: Vec::new(),
             watchers: Vec::new(),
+            next: 1,
+            foreign_keys: foreign_keys.clone(),
+            children: Vec::new(),
         });
         self.by_name.insert(name.to_string(), id.0);
         let columns = self.tables[id.0].columns.clone();
@@ -566,6 +697,7 @@ impl Db {
             name: name.to_string(),
             key: key.to_string(),
             columns,
+            foreign_keys,
         })?;
         Ok(id)
     }
@@ -578,15 +710,15 @@ impl Db {
     #[inline]
     pub fn table(&self, id: TableId) -> &Table { &self.tables[id.0] }
 
-    /// A table to change directly. This does not reach the log, so it
-    /// is only for the inside of the crate, where the caller has already
-    /// arranged for the change to be recorded.
-    #[inline]
-    fn table_mut(&mut self, id: TableId) -> &mut Table { &mut self.tables[id.0] }
-
     pub fn table_names(&self) -> impl Iterator<Item = &str> {
-        self.tables.iter().map(|t| t.name.as_str())
+        self.tables.iter().filter(|t| !t.dropped).map(|t| t.name.as_str())
     }
+
+    /// The key the next insert into this table gets when it gives none.
+    pub fn next_key(&self, table: TableId) -> i64 { self.tables[table.0].next_key() }
+
+    /// The key of the last row put in, by any table.
+    pub fn last_insert_key(&self) -> i64 { self.last_key }
 
     // ── SQL ────────────────────────────────────────────────────────────
 
@@ -616,6 +748,15 @@ impl Db {
         }
     }
 
+    /// Run several statements, cut apart at the semicolons, one after
+    /// the other. The first that fails stops the rest.
+    pub fn execute_batch(&mut self, sql: &str) -> Result<()> {
+        for one in sql::split(sql) {
+            self.execute(&one, &[])?;
+        }
+        Ok(())
+    }
+
     // ── Transactions ───────────────────────────────────────────────────
 
     pub fn begin(&mut self) {
@@ -637,26 +778,63 @@ impl Db {
         self.in_txn = false;
         self.journal.clear();
         self.journal_count = 0;
-        // Every step back has to reach the indexes too, or a rolled back
-        // insert would stay findable through one.
         while let Some(step) = self.undo.pop() {
-            match step {
-                Undo::Added(id, key) | Undo::Was(id, key, None) => {
-                    if let Some(row) = self.tables[id.0].take(key) {
-                        self.index_take(id, key, &row);
-                    }
+            self.step_back(step);
+        }
+    }
+
+    /// One step back. It has to reach the indexes too, or a rolled back
+    /// insert would stay findable through one.
+    fn step_back(&mut self, step: Undo) {
+        match step {
+            Undo::Added(id, key) | Undo::Was(id, key, None) => {
+                if let Some(row) = self.tables[id.0].take(key) {
+                    self.index_take(id, key, &row);
                 }
-                Undo::Was(id, key, Some(row)) => {
-                    if let Some(now) = self.tables[id.0].place(key, row.clone()) {
-                        self.index_take(id, key, &now);
-                    }
-                    self.index_add(id, key, &row);
+            }
+            Undo::Was(id, key, Some(row)) => {
+                if let Some(now) = self.tables[id.0].place(key, row.clone()) {
+                    self.index_take(id, key, &now);
                 }
+                self.index_add(id, key, &row);
             }
         }
     }
 
     pub fn in_transaction(&self) -> bool { self.in_txn }
+
+    /// Where a statement starts, so that one that fails halfway can be
+    /// taken back on its own, inside a transaction or not. SQL promises
+    /// that a statement changes everything it matched or nothing.
+    pub(crate) fn mark(&mut self) -> Mark {
+        let was_in_txn = self.in_txn;
+        if !was_in_txn {
+            self.in_txn = true;
+            self.undo.clear();
+        }
+        Mark { undo: self.undo.len(), journal: self.journal.len(), count: self.journal_count, was_in_txn }
+    }
+
+    /// The statement went through: keep it, and commit it if it was on
+    /// its own.
+    pub(crate) fn release(&mut self, m: Mark) -> Result<()> {
+        if m.was_in_txn { Ok(()) } else { self.commit() }
+    }
+
+    /// The statement failed: take back everything since the mark.
+    pub(crate) fn undo_to(&mut self, m: Mark) {
+        while self.undo.len() > m.undo {
+            let step = self.undo.pop().expect("more undo steps than the mark");
+            self.step_back(step);
+        }
+        self.journal.truncate(m.journal);
+        self.journal_count = m.count;
+        if !m.was_in_txn {
+            self.in_txn = false;
+            self.journal.clear();
+            self.journal_count = 0;
+        }
+    }
 
     /// Remember that a row has just been added.
     #[inline]
@@ -673,9 +851,13 @@ impl Db {
         }
     }
 
-    /// Throw a table away, with everything in it.
+    /// Throw a table away, with everything in it. A table that other
+    /// tables' foreign keys point at stays.
     pub fn drop_table(&mut self, name: &str) -> Result<()> {
         let i = *self.by_name.get(name).ok_or_else(|| Error::NoTable(name.to_string()))?;
+        if self.tables[i].children.iter().any(|&c| !self.tables[c].dropped) {
+            return Err(Error::ForeignKey(format!("other tables still point at {name}")));
+        }
         self.forget_table(i);
         self.record(Change::DropTable { name: name.to_string() })
     }
@@ -692,6 +874,9 @@ impl Db {
             self.indexes[slot].dropped = true;
             self.index_names.remove(&self.indexes[slot].name.clone());
         }
+        for fk in std::mem::take(&mut self.tables[i].foreign_keys) {
+            self.tables[fk.parent.0].children.retain(|&c| c != i);
+        }
     }
 
     // ── Indexes ────────────────────────────────────────────────────────
@@ -699,25 +884,53 @@ impl Db {
     /// Make an index on one column, and fill it from the rows already
     /// there.
     pub fn create_index(&mut self, name: &str, table: TableId, column: usize) -> Result<IndexId> {
+        self.create_index_full(name, table, vec![column], false)
+    }
+
+    /// Make an index on one or more columns. A unique one refuses two
+    /// rows with the same values, and is refused itself if the rows
+    /// already there have any.
+    pub fn create_index_full(
+        &mut self,
+        name: &str,
+        table: TableId,
+        columns: Vec<usize>,
+        unique: bool,
+    ) -> Result<IndexId> {
         if self.index_names.contains_key(name) {
             return Err(Error::IndexExists(name.to_string()));
         }
-        if column >= self.tables[table.0].columns.len() {
-            return Err(Error::NoColumn(column));
+        if columns.is_empty() { return Err(Error::Sql("an index needs a column".into())); }
+        for &c in &columns {
+            if c >= self.tables[table.0].columns.len() { return Err(Error::NoColumn(c)); }
         }
-        let slot = self.indexes.len();
-        self.indexes.push(Index {
+        let mut index = Index {
             name: name.to_string(),
             table,
-            column,
+            columns,
+            unique,
             entries: BTreeMap::new(),
             dropped: false,
-        });
+        };
+        for (key, slot, row) in self.tables[table.0].iter_slots() {
+            let k = index.key_of(row);
+            if let Some(other) = index.clash(&k, key) {
+                return Err(Error::Unique(format!("{} (rows {other} and {key})", index.what())));
+            }
+            index.add(k, index.own(row), key, slot);
+        }
+        let column_names: Vec<String> =
+            index.columns.iter().map(|&c| self.tables[table.0].columns[c].name.clone()).collect();
+        let slot = self.indexes.len();
+        self.indexes.push(index);
         self.index_names.insert(name.to_string(), slot);
         self.tables[table.0].watchers.push(slot);
-        self.fill_index(slot);
-        let column = self.tables[table.0].columns[column].name.clone();
-        self.record(Change::NewIndex { name: name.to_string(), table: table.0 as u32, column })?;
+        self.record(Change::NewIndex {
+            name: name.to_string(),
+            table: table.0 as u32,
+            columns: column_names,
+            unique,
+        })?;
         Ok(IndexId(slot))
     }
 
@@ -727,12 +940,26 @@ impl Db {
 
     pub fn index(&self, id: IndexId) -> &Index { &self.indexes[id.0] }
 
-    /// An index on this column of this table, if there is one.
+    /// An index on this one column of this table, if there is one.
     pub fn index_on(&self, table: TableId, column: usize) -> Option<IndexId> {
         self.tables[table.0]
             .watchers
             .iter()
-            .find(|&&s| !self.indexes[s].dropped && self.indexes[s].column == column)
+            .find(|&&s| !self.indexes[s].dropped && self.indexes[s].columns == [column])
+            .map(|&s| IndexId(s))
+    }
+
+    /// An index whose columns are all among these, if there is one. The
+    /// widest wins, since it narrows the rows down the most.
+    pub fn index_within(&self, table: TableId, columns: &[usize]) -> Option<IndexId> {
+        self.tables[table.0]
+            .watchers
+            .iter()
+            .filter(|&&s| {
+                let ix = &self.indexes[s];
+                !ix.dropped && ix.columns.iter().all(|c| columns.contains(c))
+            })
+            .max_by_key(|&&s| self.indexes[s].columns.len())
             .map(|&s| IndexId(s))
     }
 
@@ -748,13 +975,12 @@ impl Db {
 
     fn fill_index(&mut self, slot: usize) {
         let table = self.indexes[slot].table;
-        let column = self.indexes[slot].column;
-        let triples: Vec<(i64, u32, Value)> = self.tables[table.0]
+        let triples: Vec<(i64, u32, IndexKey, Value)> = self.tables[table.0]
             .iter_slots()
-            .filter_map(|(k, s, row)| row.get(column).map(|v| (k, s, v.clone())))
+            .map(|(k, s, row)| (k, s, self.indexes[slot].key_of(row), self.indexes[slot].own(row)))
             .collect();
-        for (key, at, value) in triples {
-            self.indexes[slot].add(&value, key, at);
+        for (key, at, k, own) in triples {
+            self.indexes[slot].add(k, own, key, at);
         }
     }
 
@@ -763,10 +989,9 @@ impl Db {
         if self.tables[table.0].watchers.is_empty() { return; }
         let Some(at) = self.tables[table.0].slot_of(key) else { return };
         for slot in self.tables[table.0].watchers.clone() {
-            if let Some(v) = row.get(self.indexes[slot].column) {
-                let v = v.clone();
-                self.indexes[slot].add(&v, key, at);
-            }
+            let k = self.indexes[slot].key_of(row);
+            let own = self.indexes[slot].own(row);
+            self.indexes[slot].add(k, own, key, at);
         }
     }
 
@@ -774,15 +999,58 @@ impl Db {
     fn index_take(&mut self, table: TableId, key: i64, row: &Row) {
         if self.tables[table.0].watchers.is_empty() { return; }
         for slot in self.tables[table.0].watchers.clone() {
-            if let Some(v) = row.get(self.indexes[slot].column) {
-                let v = v.clone();
-                self.indexes[slot].remove(&v, key);
-            }
+            let k = self.indexes[slot].key_of(row);
+            self.indexes[slot].remove(&k, key);
         }
     }
 
     #[inline]
     fn watched(&self, table: TableId) -> bool { !self.tables[table.0].watchers.is_empty() }
+
+    /// The rows that an insert of this row under this key would clash
+    /// with: the one under the key, and any that a unique index already
+    /// holds with the same values.
+    pub fn clashes(&self, table: TableId, key: i64, row: &Row) -> Vec<i64> {
+        let t = &self.tables[table.0];
+        let mut out = Vec::new();
+        if t.rows.contains_key(&key) { out.push(key); }
+        for &slot in &t.watchers {
+            let ix = &self.indexes[slot];
+            if let Some(other) = ix.clash(&ix.key_of(row), key) {
+                if !out.contains(&other) { out.push(other); }
+            }
+        }
+        out
+    }
+
+    /// Refuse a row that a unique index already holds the like of.
+    fn unique_check(&self, table: TableId, key: i64, row: &Row) -> Result<()> {
+        for &slot in &self.tables[table.0].watchers {
+            let ix = &self.indexes[slot];
+            if let Some(other) = ix.clash(&ix.key_of(row), key) {
+                return Err(Error::Unique(format!("{} (row {other})", ix.what())));
+            }
+        }
+        Ok(())
+    }
+
+    /// Refuse a row whose foreign keys point at rows that are not there.
+    fn foreign_check(&self, table: TableId, row: &Row) -> Result<()> {
+        for fk in &self.tables[table.0].foreign_keys {
+            match &row[fk.column] {
+                Value::Null => {}
+                Value::Int(k) if self.tables[fk.parent.0].rows.contains_key(k) => {}
+                other => {
+                    return Err(Error::ForeignKey(format!(
+                        "{} points at row {other:?} of {}, which is not there",
+                        self.tables[table.0].columns[fk.column].name,
+                        self.tables[fk.parent.0].name
+                    )))
+                }
+            }
+        }
+        Ok(())
+    }
 
     // ── Changing rows ──────────────────────────────────────────────────
     //
@@ -825,8 +1093,13 @@ impl Db {
         self.snapshot_if_grown()
     }
 
-    /// Put a new row in. It is an error if the key is taken.
+    /// Put a new row in. It is an error if the key is taken, if a
+    /// unique index already holds the like of it, or if a foreign key
+    /// points at nothing.
     pub fn insert(&mut self, table: TableId, key: i64, row: Row) -> Result<()> {
+        let watched = self.watched(table);
+        if watched { self.unique_check(table, key, &row)?; }
+        if !self.tables[table.0].foreign_keys.is_empty() { self.foreign_check(table, &row)?; }
         if self.recording() {
             // Check before writing anything down, so a row the table
             // would refuse never reaches the log.
@@ -838,8 +1111,9 @@ impl Db {
         } else {
             self.tables[table.0].insert(key, row)?;
         }
+        self.last_key = key;
         self.note_insert(table, key);
-        if self.watched(table) {
+        if watched {
             let row = self.tables[table.0].get(key).cloned().expect("the row that was just put in");
             self.index_add(table, key, &row);
         }
@@ -848,19 +1122,22 @@ impl Db {
 
     /// Put a row in over whatever was there. Gives back the old row.
     pub fn put(&mut self, table: TableId, key: i64, row: Row) -> Result<Option<Row>> {
+        let watched = self.watched(table);
+        if watched { self.unique_check(table, key, &row)?; }
+        if !self.tables[table.0].foreign_keys.is_empty() { self.foreign_check(table, &row)?; }
         if self.recording() {
             self.tables[table.0].fits_row(&row)?;
             let t = table.0 as u32;
             log::put_row(self.opening(), t, key, &row);
         }
         self.note_change(table, key);
-        let watched = self.watched(table);
         if watched {
             if let Some(old) = self.tables[table.0].get(key).cloned() {
                 self.index_take(table, key, &old);
             }
         }
         let old = self.tables[table.0].put(key, row)?;
+        self.last_key = key;
         if watched {
             let now = self.tables[table.0].get(key).cloned().expect("the row that was just put in");
             self.index_add(table, key, &now);
@@ -871,31 +1148,58 @@ impl Db {
 
     /// Change one value in an existing row.
     pub fn update(&mut self, table: TableId, key: i64, column: usize, value: Value) -> Result<()> {
+        let watched = self.watched(table);
+        // The indexes this column is part of, with what the row files
+        // under now, before anything moves.
+        let mut touched: Vec<(usize, IndexKey)> = Vec::new();
+        if watched {
+            let row = self.tables[table.0].get(key).ok_or(Error::NoKey(key))?;
+            for &slot in &self.tables[table.0].watchers {
+                let ix = &self.indexes[slot];
+                if !ix.columns.contains(&column) { continue; }
+                if ix.unique {
+                    let mut after = row.clone();
+                    after[column] = value.clone();
+                    if let Some(other) = ix.clash(&ix.key_of(&after), key) {
+                        return Err(Error::Unique(format!("{} (row {other})", ix.what())));
+                    }
+                }
+                touched.push((slot, ix.key_of(row)));
+            }
+        }
+        if self.tables[table.0].foreign_keys.iter().any(|fk| fk.column == column) {
+            let mut after = self.tables[table.0].get(key).ok_or(Error::NoKey(key))?.clone();
+            after[column] = value.clone();
+            self.foreign_check(table, &after)?;
+        }
         if self.recording() {
             self.tables[table.0].can_update(key, column, &value)?;
             let t = table.0 as u32;
             log::put_set(self.opening(), t, key, column as u32, &value);
         }
         self.note_change(table, key);
-        let watched = self.watched(table);
-        let was = if watched { self.tables[table.0].get_at(key, column).cloned() } else { None };
         self.tables[table.0].update(key, column, value)?;
-        if watched {
-            let slots = self.tables[table.0].watchers.clone();
-            let now = self.tables[table.0].get_at(key, column).cloned();
+        if !touched.is_empty() {
             let at = self.tables[table.0].slot_of(key).expect("the row that was just changed");
-            for slot in slots {
-                if self.indexes[slot].column != column { continue; }
-                if let Some(v) = &was { self.indexes[slot].remove(v, key); }
-                if let Some(v) = &now { self.indexes[slot].add(v, key, at); }
+            let row = self.tables[table.0].get(key).expect("the row that was just changed").clone();
+            for (slot, was) in touched {
+                self.indexes[slot].remove(&was, key);
+                let k = self.indexes[slot].key_of(&row);
+                let own = self.indexes[slot].own(&row);
+                self.indexes[slot].add(k, own, key, at);
             }
         }
         self.close_if_alone()
     }
 
-    /// Take a row out. True when there was one.
+    /// Take a row out. True when there was one. Rows in other tables
+    /// that point at it go with it when their foreign key says so, and
+    /// stop the delete when it does not.
     pub fn delete(&mut self, table: TableId, key: i64) -> Result<bool> {
         if self.tables[table.0].get(key).is_none() { return Ok(false); }
+        if !self.tables[table.0].children.is_empty() {
+            self.delete_children(table, key)?;
+        }
         if self.recording() {
             let t = table.0 as u32;
             log::put_delete(self.opening(), t, key);
@@ -909,6 +1213,39 @@ impl Db {
         self.tables[table.0].delete(key);
         self.close_if_alone()?;
         Ok(true)
+    }
+
+    /// The rows in other tables pointing at this one: gone if their
+    /// foreign key cascades, and an error otherwise.
+    fn delete_children(&mut self, table: TableId, key: i64) -> Result<()> {
+        let children = self.tables[table.0].children.clone();
+        for c in children {
+            if self.tables[c].dropped { continue; }
+            let fks: Vec<ForeignKey> = self.tables[c]
+                .foreign_keys
+                .iter()
+                .filter(|fk| fk.parent == table)
+                .cloned()
+                .collect();
+            for fk in fks {
+                let want = Value::Int(key);
+                let keys: Vec<i64> = match self.index_on(TableId(c), fk.column) {
+                    Some(ix) => self.indexes[ix.0].keys_for(&want).map(|k| k.copied().collect()).unwrap_or_default(),
+                    None => self.tables[c].iter().filter(|(_, r)| r[fk.column] == want).map(|(k, _)| k).collect(),
+                };
+                if keys.is_empty() { continue; }
+                if !fk.cascade {
+                    return Err(Error::ForeignKey(format!(
+                        "rows of {} still point at row {key} of {}",
+                        self.tables[c].name, self.tables[table.0].name
+                    )));
+                }
+                for k in keys {
+                    self.delete(TableId(c), k)?;
+                }
+            }
+        }
+        Ok(())
     }
 
     // ── The files ──────────────────────────────────────────────────────
@@ -994,6 +1331,7 @@ impl Db {
                 name: t.name.clone(),
                 key: t.key.clone(),
                 columns: t.columns.clone(),
+                foreign_keys: t.foreign_keys.clone(),
             });
             if t.dropped {
                 out.push(Change::DropTable { name: t.name.clone() });
@@ -1002,13 +1340,18 @@ impl Db {
             for (key, row) in t.iter() {
                 out.push(Change::Put { table: i as u32, key, row: row.clone() });
             }
+            // The rows that were deleted are not written out, so their
+            // keys would come round again without this.
+            out.push(Change::Next { table: i as u32, key: t.next });
         }
         for index in &self.indexes {
             if index.dropped { continue; }
+            let t = &self.tables[index.table.0];
             out.push(Change::NewIndex {
                 name: index.name.clone(),
                 table: index.table.0 as u32,
-                column: self.tables[index.table.0].columns[index.column].name.clone(),
+                columns: index.columns.iter().map(|&c| t.columns[c].name.clone()).collect(),
+                unique: index.unique,
             });
         }
         out
@@ -1019,8 +1362,8 @@ impl Db {
     fn replay(&mut self, changes: Vec<Change>) -> Result<()> {
         for change in changes {
             match change {
-                Change::NewTable { name, key, columns } => {
-                    self.create_table_full(&name, &key, columns)?;
+                Change::NewTable { name, key, columns, foreign_keys } => {
+                    self.create_table_full(&name, &key, columns, foreign_keys)?;
                 }
                 Change::DropTable { name } => {
                     if let Some(&i) = self.by_name.get(&name) {
@@ -1044,18 +1387,28 @@ impl Db {
                         .ok_or_else(|| Error::Disk(format!("the log names table {table}, which is not there")))?;
                     t.take(key);
                 }
-                Change::NewIndex { name, table, column } => {
+                Change::Next { table, key } => {
+                    if let Some(t) = self.tables.get_mut(table as usize) {
+                        t.next = t.next.max(key);
+                    }
+                }
+                Change::NewIndex { name, table, columns, unique } => {
                     let t = self.tables.get(table as usize)
                         .ok_or_else(|| Error::Disk(format!("the log names table {table}, which is not there")))?;
-                    let col = t.column_of(&column)
-                        .ok_or_else(|| Error::Disk(format!("the log names column {column}, which is not there")))?;
+                    let mut cols = Vec::with_capacity(columns.len());
+                    for column in &columns {
+                        cols.push(t.column_of(column).ok_or_else(|| {
+                            Error::Disk(format!("the log names column {column}, which is not there"))
+                        })?);
+                    }
                     // Filled in once the replay is over, because the rows
                     // it covers may still be coming.
                     let slot = self.indexes.len();
                     self.indexes.push(Index {
                         name: name.clone(),
                         table: TableId(table as usize),
-                        column: col,
+                        columns: cols,
+                        unique,
                         entries: BTreeMap::new(),
                         dropped: false,
                     });
@@ -1072,6 +1425,13 @@ impl Db {
             }
         }
         Ok(())
+    }
+}
+
+impl Index {
+    /// The index's columns, for an error message.
+    fn what(&self) -> String {
+        format!("{} ({} columns)", self.name, self.columns.len())
     }
 }
 
@@ -1105,6 +1465,8 @@ mod tests {
         assert_eq!(db.table(id).get(7), Some(&row(7)));
         assert_eq!(db.table(id).get_at(7, 0), Some(&Value::Int(7)));
         assert_eq!(db.table(id).len(), 1);
+        assert_eq!(db.last_insert_key(), 7);
+        assert_eq!(db.next_key(id), 8);
     }
 
     #[test]
@@ -1112,6 +1474,7 @@ mod tests {
         let (db, id) = kv();
         assert_eq!(db.table(id).get(1), None);
         assert_eq!(db.table(id).get_at(1, 0), None);
+        assert_eq!(db.next_key(id), 1);
     }
 
     #[test]
@@ -1146,7 +1509,8 @@ mod tests {
             .create_table_full(
                 "t",
                 "id",
-                vec![Column { name: "a".into(), kind: Kind::Int, null_ok: false }],
+                vec![Column { name: "a".into(), kind: Kind::Int, null_ok: false, default: Value::Null }],
+                Vec::new(),
             )
             .unwrap();
         assert_eq!(
@@ -1193,6 +1557,7 @@ mod tests {
         assert_eq!(keys, vec![1, 3, 5, 9]);
         let in_range: Vec<i64> = db.table(id).range(2, 6).map(|(k, _)| k).collect();
         assert_eq!(in_range, vec![3, 5]);
+        assert_eq!(db.next_key(id), 10);
     }
 
     #[test]
@@ -1224,6 +1589,76 @@ mod tests {
         db.drop_table("kv").unwrap();
         assert_eq!(db.table_id("kv"), Err(Error::NoTable("kv".into())));
         assert_eq!(db.drop_table("kv"), Err(Error::NoTable("kv".into())));
+    }
+
+    #[test]
+    fn a_unique_index_refuses_a_second_of_the_same() {
+        let (mut db, id) = kv();
+        db.insert(id, 1, row(1)).unwrap();
+        db.insert(id, 2, row(2)).unwrap();
+        db.create_index_full("kv_a", id, vec![0], true).unwrap();
+        // The same a as row 2.
+        assert!(matches!(db.insert(id, 3, row(2)), Err(Error::Unique(_))));
+        assert!(matches!(db.update(id, 1, 0, Value::Int(2)), Err(Error::Unique(_))));
+        // Nulls never clash.
+        db.insert(id, 3, vec![Value::Null, Value::Real(0.0), Value::Null]).unwrap();
+        db.insert(id, 4, vec![Value::Null, Value::Real(0.0), Value::Null]).unwrap();
+        // A row may keep its own value.
+        db.update(id, 1, 0, Value::Int(1)).unwrap();
+        assert_eq!(db.clashes(id, 9, &row(2)).as_slice(), &[2]);
+        assert_eq!(db.clashes(id, 2, &row(7)).as_slice(), &[2]);
+        assert!(db.clashes(id, 9, &row(7)).is_empty());
+        // And one over two columns, made after the fact, checks what is
+        // there first.
+        db.insert(id, 5, vec![Value::Int(5), Value::Real(1.0), Value::Text("x".into())]).unwrap();
+        db.insert(id, 6, vec![Value::Int(6), Value::Real(1.0), Value::Text("x".into())]).unwrap();
+        assert!(matches!(db.create_index_full("kv_bc", id, vec![1, 2], true), Err(Error::Unique(_))));
+        assert!(db.index_id("kv_bc").is_err());
+        db.create_index_full("kv_bc", id, vec![1, 2], false).unwrap();
+        let ix = db.index_id("kv_bc").unwrap();
+        let both: Vec<i64> = db.index(ix).rows_for_all(&[Value::Real(1.0), Value::Text("x".into())]).unwrap().keys().copied().collect();
+        assert_eq!(both, vec![5, 6]);
+        assert_eq!(db.index_within(id, &[2, 1, 0]), Some(ix));
+        assert_eq!(db.index_within(id, &[2]), None);
+    }
+
+    #[test]
+    fn a_foreign_key_holds_both_ways() {
+        let mut db = Db::new();
+        let parent = db.create_table("p", &[("x", Kind::Int)]).unwrap();
+        let kid = db
+            .create_table_full(
+                "k",
+                "id",
+                vec![Column { name: "p".into(), kind: Kind::Int, null_ok: true, default: Value::Null }],
+                vec![ForeignKey { column: 0, parent, cascade: true }],
+            )
+            .unwrap();
+        let held = db
+            .create_table_full(
+                "h",
+                "id",
+                vec![Column { name: "p".into(), kind: Kind::Int, null_ok: true, default: Value::Null }],
+                vec![ForeignKey { column: 0, parent, cascade: false }],
+            )
+            .unwrap();
+        db.insert(parent, 1, vec![Value::Int(0)]).unwrap();
+        db.insert(parent, 2, vec![Value::Int(0)]).unwrap();
+        // Pointing at nothing is refused; null points at nothing and is fine.
+        assert!(matches!(db.insert(kid, 1, vec![Value::Int(9)]), Err(Error::ForeignKey(_))));
+        db.insert(kid, 1, vec![Value::Null]).unwrap();
+        db.insert(kid, 2, vec![Value::Int(1)]).unwrap();
+        db.insert(kid, 3, vec![Value::Int(1)]).unwrap();
+        assert!(matches!(db.update(kid, 2, 0, Value::Int(9)), Err(Error::ForeignKey(_))));
+        db.insert(held, 1, vec![Value::Int(2)]).unwrap();
+        // The kids go with the parent; the held one holds it.
+        assert!(db.delete(parent, 1).unwrap());
+        assert_eq!(db.table(kid).len(), 1);
+        assert!(matches!(db.delete(parent, 2), Err(Error::ForeignKey(_))));
+        assert!(matches!(db.drop_table("p"), Err(Error::ForeignKey(_))));
+        db.drop_table("h").unwrap();
+        db.drop_table("k").unwrap();
+        db.drop_table("p").unwrap();
     }
 
     #[test]

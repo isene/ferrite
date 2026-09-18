@@ -10,7 +10,7 @@ use crate::{Error, Kind, Result, Value};
 
 // ── Words ──────────────────────────────────────────────────────────────
 
-/// How two things are compared in a WHERE.
+/// How two things are compared.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Cmp { Eq, Ne, Lt, Le, Gt, Ge }
 
@@ -25,6 +25,17 @@ impl Cmp {
             Cmp::Le => ordering != Greater,
             Cmp::Gt => ordering == Greater,
             Cmp::Ge => ordering != Less,
+        }
+    }
+
+    /// The same comparison with the two sides swapped.
+    pub fn flipped(&self) -> Cmp {
+        match self {
+            Cmp::Lt => Cmp::Gt,
+            Cmp::Le => Cmp::Ge,
+            Cmp::Gt => Cmp::Lt,
+            Cmp::Ge => Cmp::Le,
+            same => *same,
         }
     }
 }
@@ -119,7 +130,7 @@ fn scan(sql: &str) -> Result<Vec<Tok>> {
             '=' => out.push(Tok::Cmp(Cmp::Eq)),
             '<' => out.push(Tok::Cmp(Cmp::Lt)),
             '>' => out.push(Tok::Cmp(Cmp::Gt)),
-            '(' | ')' | ',' | '*' | ';' | '.' | '-' | '+' => out.push(Tok::Sym(c)),
+            '(' | ')' | ',' | '*' | ';' | '.' | '-' | '+' | '/' => out.push(Tok::Sym(c)),
             _ => return Err(sql_err(&format!("I do not know what to do with {c}"))),
         }
         i += 1;
@@ -130,14 +141,6 @@ fn scan(sql: &str) -> Result<Vec<Tok>> {
 fn sql_err(what: &str) -> Error { Error::Sql(what.to_string()) }
 
 // ── Shape ──────────────────────────────────────────────────────────────
-
-/// A value written into the query, or a slot to fill in when it runs.
-#[derive(Debug, Clone, PartialEq)]
-pub enum Expr {
-    Lit(Value),
-    /// `?1` is slot 0.
-    Param(usize),
-}
 
 /// A column, and which table it came from when that has to be said.
 #[derive(Debug, Clone, PartialEq)]
@@ -159,45 +162,102 @@ impl std::fmt::Display for Name {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
-pub struct Cond {
-    pub column: Name,
-    pub cmp: Cmp,
-    pub value: Expr,
-}
-
 /// The four things a query can work out over a lot of rows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Func { Count, Sum, Min, Max }
 
-/// One of them, and what it is over. `COUNT(*)` has nothing.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Agg {
-    pub func: Func,
-    pub arg: Option<Name>,
+/// What joins the two sides of an expression.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Op {
+    Cmp(Cmp),
+    And,
+    Or,
+    Add,
+    Sub,
+    Mul,
+    Div,
 }
 
-/// A column to sort by, and which way.
+/// Anything that comes out as a value: a literal, a slot, a column, or
+/// something worked out from those.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Expr {
+    Lit(Value),
+    /// `?1` is slot 0.
+    Param(usize),
+    Column(Name),
+    Not(Box<Expr>),
+    /// `x IS NULL`, or `x IS NOT NULL` when the flag is set.
+    IsNull(Box<Expr>, bool),
+    /// `x BETWEEN a AND b`, or `NOT BETWEEN` when the flag is set.
+    Between { what: Box<Expr>, low: Box<Expr>, high: Box<Expr>, not: bool },
+    Bin(Box<Expr>, Op, Box<Expr>),
+    /// `COALESCE(a, b, ...)`: the first that is not null.
+    Coalesce(Vec<Expr>),
+    /// `COUNT(*)` has no argument; the others have one.
+    Agg(Func, Option<Box<Expr>>),
+}
+
+impl Expr {
+    /// True when an aggregate sits anywhere inside.
+    pub fn has_aggregate(&self) -> bool {
+        match self {
+            Expr::Agg(..) => true,
+            Expr::Lit(_) | Expr::Param(_) | Expr::Column(_) => false,
+            Expr::Not(e) | Expr::IsNull(e, _) => e.has_aggregate(),
+            Expr::Between { what, low, high, .. } => {
+                what.has_aggregate() || low.has_aggregate() || high.has_aggregate()
+            }
+            Expr::Bin(a, _, b) => a.has_aggregate() || b.has_aggregate(),
+            Expr::Coalesce(v) => v.iter().any(Expr::has_aggregate),
+        }
+    }
+
+    /// The highest `?` slot used, plus one.
+    pub fn params(&self) -> usize {
+        match self {
+            Expr::Param(n) => n + 1,
+            Expr::Lit(_) | Expr::Column(_) => 0,
+            Expr::Not(e) | Expr::IsNull(e, _) => e.params(),
+            Expr::Between { what, low, high, .. } => what.params().max(low.params()).max(high.params()),
+            Expr::Bin(a, _, b) => a.params().max(b.params()),
+            Expr::Coalesce(v) => v.iter().map(Expr::params).max().unwrap_or(0),
+            Expr::Agg(_, e) => e.as_ref().map_or(0, |e| e.params()),
+        }
+    }
+
+    /// The parts of an AND chain, so `a AND b AND c` is three things.
+    pub fn conjuncts(self) -> Vec<Expr> {
+        match self {
+            Expr::Bin(a, Op::And, b) => {
+                let mut out = a.conjuncts();
+                out.extend(b.conjuncts());
+                out
+            }
+            other => vec![other],
+        }
+    }
+}
+
+/// Something to sort by, and which way.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Order {
-    pub name: Name,
+    pub expr: Expr,
     pub desc: bool,
 }
 
-/// A second table, joined on one column being equal to another.
+/// A second table, joined on a condition.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Join {
     pub table: String,
-    pub left: Name,
-    pub right: Name,
+    pub alias: Option<String>,
+    pub on: Expr,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Project {
     All,
-    Columns(Vec<Name>),
-    /// A select list that is all aggregates, which gives one row back.
-    Aggs(Vec<Agg>),
+    Exprs(Vec<Expr>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -206,29 +266,82 @@ pub struct ColDef {
     pub kind: Kind,
     pub primary: bool,
     pub null_ok: bool,
+    pub unique: bool,
+    pub default: Option<Value>,
 }
+
+/// A foreign key: this table's column points at another table's key,
+/// and the row here goes with the row there when the flag is set.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForeignKey {
+    pub column: String,
+    pub table: String,
+    pub cascade: bool,
+}
+
+/// What to do when an INSERT would land on a row that is already there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnConflict { Fail, Ignore, Replace }
 
 /// One statement, as written. Nothing here has been checked against a
 /// real table yet.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
-    CreateTable { name: String, columns: Vec<ColDef>, if_missing: bool },
-    CreateIndex { name: String, table: String, column: String, if_missing: bool },
+    CreateTable {
+        name: String,
+        columns: Vec<ColDef>,
+        /// A key spelt out at the end: `PRIMARY KEY(a, b)`.
+        key_columns: Vec<String>,
+        /// Uniqueness spelt out at the end: `UNIQUE(a, b)`.
+        unique_sets: Vec<Vec<String>>,
+        foreign_keys: Vec<ForeignKey>,
+        if_missing: bool,
+    },
+    DropTable { name: String, if_there: bool },
+    CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool, if_missing: bool },
     DropIndex { name: String, if_there: bool },
-    Insert { table: String, columns: Vec<String>, values: Vec<Expr> },
+    Insert { table: String, columns: Vec<String>, values: Vec<Expr>, on_conflict: OnConflict },
     Select {
         table: String,
+        alias: Option<String>,
         join: Option<Join>,
         project: Project,
-        filter: Vec<Cond>,
+        filter: Option<Expr>,
         order: Vec<Order>,
         limit: Option<usize>,
     },
-    Update { table: String, sets: Vec<(String, Expr)>, filter: Vec<Cond> },
-    Delete { table: String, filter: Vec<Cond> },
+    Update { table: String, sets: Vec<(String, Expr)>, filter: Option<Expr> },
+    Delete { table: String, filter: Option<Expr> },
     Begin,
     Commit,
     Rollback,
+    /// A PRAGMA is read and let go. There is nothing here it could set.
+    Nothing,
+}
+
+impl Stmt {
+    /// How many `?` slots the statement wants.
+    pub fn params(&self) -> usize {
+        let of = |es: &[&Expr]| es.iter().map(|e| e.params()).max().unwrap_or(0);
+        match self {
+            Stmt::Insert { values, .. } => of(&values.iter().collect::<Vec<_>>()),
+            Stmt::Select { join, project, filter, order, .. } => {
+                let mut all: Vec<&Expr> = Vec::new();
+                if let Some(j) = join { all.push(&j.on); }
+                if let Project::Exprs(items) = project { all.extend(items.iter()); }
+                if let Some(f) = filter { all.push(f); }
+                all.extend(order.iter().map(|o| &o.expr));
+                of(&all)
+            }
+            Stmt::Update { sets, filter, .. } => {
+                let mut all: Vec<&Expr> = sets.iter().map(|(_, e)| e).collect();
+                if let Some(f) = filter { all.push(f); }
+                of(&all)
+            }
+            Stmt::Delete { filter, .. } => filter.as_ref().map_or(0, Expr::params),
+            _ => 0,
+        }
+    }
 }
 
 // ── Parsing ────────────────────────────────────────────────────────────
@@ -249,6 +362,36 @@ pub fn parse(sql: &str) -> Result<Stmt> {
     Ok(stmt)
 }
 
+/// Cut a run of statements apart at the semicolons, minding the ones
+/// inside strings and comments.
+pub fn split(sql: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = String::new();
+    let mut in_str = false;
+    let mut chars = sql.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => { in_str = !in_str; cur.push(c); }
+            ';' if !in_str => {
+                if !cur.trim().is_empty() { out.push(cur.trim().to_string()); }
+                cur.clear();
+            }
+            '-' if !in_str && chars.peek() == Some(&'-') => {
+                for d in chars.by_ref() { if d == '\n' { break; } }
+            }
+            _ => cur.push(c),
+        }
+    }
+    if !cur.trim().is_empty() { out.push(cur.trim().to_string()); }
+    out
+}
+
+/// Words that cannot be a table's short name, because they start the
+/// next part of the statement.
+const NOT_AN_ALIAS: &[&str] = &[
+    "join", "inner", "left", "cross", "on", "where", "order", "limit", "group", "set", "values",
+];
+
 impl Parser {
     fn peek(&self) -> Option<&Tok> { self.toks.get(self.at) }
 
@@ -258,12 +401,14 @@ impl Parser {
         t
     }
 
+    fn peek_word(&self, want: &str) -> bool {
+        matches!(self.peek(), Some(Tok::Word(w)) if w.eq_ignore_ascii_case(want))
+    }
+
     /// True (and step over it) when the next word is this one, whatever
     /// its case.
     fn eat_word(&mut self, want: &str) -> bool {
-        if let Some(Tok::Word(w)) = self.peek() {
-            if w.eq_ignore_ascii_case(want) { self.at += 1; return true; }
-        }
+        if self.peek_word(want) { self.at += 1; return true; }
         false
     }
 
@@ -290,23 +435,63 @@ impl Parser {
         }
     }
 
-    /// A column name, which may say its table first.
-    fn qualified(&mut self) -> Result<Name> {
-        let first = self.name()?;
-        if self.eat_sym('.') {
-            let column = self.name()?;
-            return Ok(Name { table: Some(first), column });
+    /// A table name, and the short name it goes by in this query if one
+    /// was given: `events e` or `events AS e`.
+    fn table_and_alias(&mut self) -> Result<(String, Option<String>)> {
+        let table = self.name()?;
+        if self.eat_word("as") { return Ok((table, Some(self.name()?))); }
+        match self.peek() {
+            Some(Tok::Word(w)) if !NOT_AN_ALIAS.iter().any(|k| w.eq_ignore_ascii_case(k)) => {
+                Ok((table, Some(self.name()?)))
+            }
+            _ => Ok((table, None)),
         }
-        Ok(Name { table: None, column: first })
+    }
+
+    fn names_in_parens(&mut self) -> Result<Vec<String>> {
+        self.want_sym('(')?;
+        let mut out = Vec::new();
+        loop {
+            out.push(self.name()?);
+            self.eat_word("asc");
+            self.eat_word("desc");
+            if !self.eat_sym(',') { break; }
+        }
+        self.want_sym(')')?;
+        Ok(out)
+    }
+
+    fn if_not_exists(&mut self) -> Result<bool> {
+        if self.eat_word("if") {
+            self.want_word("not")?;
+            self.want_word("exists")?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    fn if_exists(&mut self) -> Result<bool> {
+        if self.eat_word("if") {
+            self.want_word("exists")?;
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     fn statement(&mut self) -> Result<Stmt> {
         if self.eat_word("create") { return self.create(); }
-        if self.eat_word("drop") { return self.drop_index(); }
+        if self.eat_word("drop") { return self.drop(); }
         if self.eat_word("insert") { return self.insert(); }
         if self.eat_word("select") { return self.select(); }
         if self.eat_word("update") { return self.update(); }
         if self.eat_word("delete") { return self.delete(); }
+        if self.eat_word("pragma") {
+            while let Some(t) = self.peek() {
+                if *t == Tok::Sym(';') { break; }
+                self.at += 1;
+            }
+            return Ok(Stmt::Nothing);
+        }
         if self.eat_word("begin") {
             self.eat_word("transaction");
             return Ok(Stmt::Begin);
@@ -323,90 +508,148 @@ impl Parser {
     }
 
     fn create(&mut self) -> Result<Stmt> {
-        if self.eat_word("unique") {
-            // A unique index is an ordinary one here. Refusing a
-            // repeated value is phase 4 work that nothing asks for yet,
-            // and pretending would be worse than saying so.
-            self.want_word("index")?;
-            return self.create_index();
-        }
-        if self.eat_word("index") { return self.create_index(); }
+        let unique = self.eat_word("unique");
+        if self.eat_word("index") { return self.create_index(unique); }
+        if unique { return Err(sql_err("UNIQUE goes with INDEX")); }
         self.want_word("table")?;
-        let if_missing = if self.eat_word("if") {
-            self.want_word("not")?;
-            self.want_word("exists")?;
-            true
-        } else {
-            false
-        };
+        let if_missing = self.if_not_exists()?;
         let name = self.name()?;
         self.want_sym('(')?;
         let mut columns = Vec::new();
+        let mut key_columns = Vec::new();
+        let mut unique_sets = Vec::new();
+        let mut foreign_keys = Vec::new();
         loop {
-            let col = self.name()?;
-            let kind = self.kind()?;
-            let mut primary = false;
-            let mut null_ok = true;
-            loop {
-                if self.eat_word("primary") {
-                    self.want_word("key")?;
-                    primary = true;
-                    null_ok = false;
-                } else if self.eat_word("not") {
-                    self.want_word("null")?;
-                    null_ok = false;
-                } else if self.eat_word("null") {
-                    null_ok = true;
-                } else {
-                    break;
+            if self.eat_word("primary") {
+                self.want_word("key")?;
+                key_columns = self.names_in_parens()?;
+            } else if self.eat_word("unique") {
+                unique_sets.push(self.names_in_parens()?);
+            } else if self.eat_word("foreign") {
+                self.want_word("key")?;
+                let mut cols = self.names_in_parens()?;
+                if cols.len() != 1 {
+                    return Err(sql_err("a foreign key over several columns is not something I do"));
                 }
+                foreign_keys.push(self.references(cols.remove(0))?);
+            } else {
+                let (col, fk) = self.column_def()?;
+                columns.push(col);
+                foreign_keys.extend(fk);
             }
-            columns.push(ColDef { name: col, kind, primary, null_ok });
             if !self.eat_sym(',') { break; }
         }
         self.want_sym(')')?;
-        Ok(Stmt::CreateTable { name, columns, if_missing })
+        Ok(Stmt::CreateTable { name, columns, key_columns, unique_sets, foreign_keys, if_missing })
     }
 
-    fn create_index(&mut self) -> Result<Stmt> {
-        let if_missing = if self.eat_word("if") {
-            self.want_word("not")?;
-            self.want_word("exists")?;
-            true
-        } else {
-            false
-        };
-        let name = self.name()?;
-        self.want_word("on")?;
+    /// `REFERENCES table(column) ON DELETE CASCADE`, after the word
+    /// REFERENCES has been read or is next. The column it points at is
+    /// that table's key whatever it is called, so the name is read and
+    /// let go.
+    fn references(&mut self, column: String) -> Result<ForeignKey> {
+        self.want_word("references")?;
         let table = self.name()?;
-        self.want_sym('(')?;
-        let column = self.name()?;
-        self.eat_word("asc");
-        self.eat_word("desc");
-        self.want_sym(')')?;
-        Ok(Stmt::CreateIndex { name, table, column, if_missing })
+        if self.eat_sym('(') {
+            self.name()?;
+            self.want_sym(')')?;
+        }
+        let mut cascade = false;
+        while self.eat_word("on") {
+            let which = self.name()?;
+            let action = self.name()?;
+            if action.eq_ignore_ascii_case("set") || action.eq_ignore_ascii_case("no") {
+                self.name()?;
+            }
+            if which.eq_ignore_ascii_case("delete") && action.eq_ignore_ascii_case("cascade") {
+                cascade = true;
+            }
+        }
+        Ok(ForeignKey { column, table, cascade })
     }
 
-    fn drop_index(&mut self) -> Result<Stmt> {
-        self.want_word("index")?;
-        let if_there = if self.eat_word("if") { self.want_word("exists")?; true } else { false };
+    fn column_def(&mut self) -> Result<(ColDef, Option<ForeignKey>)> {
         let name = self.name()?;
-        Ok(Stmt::DropIndex { name, if_there })
+        let kind = self.kind()?;
+        let mut def = ColDef { name, kind, primary: false, null_ok: true, unique: false, default: None };
+        let mut fk = None;
+        loop {
+            if self.eat_word("primary") {
+                self.want_word("key")?;
+                self.eat_word("asc");
+                self.eat_word("desc");
+                self.eat_word("autoincrement");
+                def.primary = true;
+            } else if self.eat_word("not") {
+                self.want_word("null")?;
+                def.null_ok = false;
+            } else if self.eat_word("null") {
+                def.null_ok = true;
+            } else if self.eat_word("unique") {
+                def.unique = true;
+            } else if self.eat_word("default") {
+                def.default = Some(match self.unary()? {
+                    Expr::Lit(v) => v,
+                    _ => return Err(sql_err("a DEFAULT has to be a plain value")),
+                });
+            } else if self.peek_word("references") {
+                fk = Some(self.references(def.name.clone())?);
+            } else {
+                break;
+            }
+        }
+        Ok((def, fk))
     }
 
     fn kind(&mut self) -> Result<Kind> {
         let word = self.name()?;
-        let k = word.to_ascii_uppercase();
-        Ok(match k.as_str() {
-            "INTEGER" | "INT" | "BIGINT" => Kind::Int,
-            "REAL" | "FLOAT" | "DOUBLE" => Kind::Real,
-            "TEXT" | "VARCHAR" | "CHAR" => Kind::Text,
+        let kind = match word.to_ascii_uppercase().as_str() {
+            "INTEGER" | "INT" | "BIGINT" | "SMALLINT" | "BOOLEAN" | "BOOL" => Kind::Int,
+            "REAL" | "FLOAT" | "DOUBLE" | "NUMERIC" => Kind::Real,
+            "TEXT" | "VARCHAR" | "CHAR" | "STRING" | "CLOB" => Kind::Text,
             "BLOB" => Kind::Blob,
             _ => return Err(sql_err(&format!("I do not know the type {word}"))),
-        })
+        };
+        // A size in brackets, like VARCHAR(64), is read and let go.
+        if self.eat_sym('(') {
+            while let Some(t) = self.next() {
+                if t == Tok::Sym(')') { break; }
+            }
+        }
+        Ok(kind)
+    }
+
+    fn create_index(&mut self, unique: bool) -> Result<Stmt> {
+        let if_missing = self.if_not_exists()?;
+        let name = self.name()?;
+        self.want_word("on")?;
+        let table = self.name()?;
+        let columns = self.names_in_parens()?;
+        Ok(Stmt::CreateIndex { name, table, columns, unique, if_missing })
+    }
+
+    fn drop(&mut self) -> Result<Stmt> {
+        if self.eat_word("index") {
+            let if_there = self.if_exists()?;
+            return Ok(Stmt::DropIndex { name: self.name()?, if_there });
+        }
+        self.want_word("table")?;
+        let if_there = self.if_exists()?;
+        Ok(Stmt::DropTable { name: self.name()?, if_there })
     }
 
     fn insert(&mut self) -> Result<Stmt> {
+        let on_conflict = if self.eat_word("or") {
+            if self.eat_word("ignore") {
+                OnConflict::Ignore
+            } else if self.eat_word("replace") {
+                OnConflict::Replace
+            } else {
+                return Err(sql_err("after INSERT OR I know IGNORE and REPLACE"));
+            }
+        } else {
+            OnConflict::Fail
+        };
         self.want_word("into")?;
         let table = self.name()?;
         let mut columns = Vec::new();
@@ -425,24 +668,24 @@ impl Parser {
             if !self.eat_sym(',') { break; }
         }
         self.want_sym(')')?;
-        Ok(Stmt::Insert { table, columns, values })
+        Ok(Stmt::Insert { table, columns, values, on_conflict })
     }
 
     fn select(&mut self) -> Result<Stmt> {
         let project = if self.eat_sym('*') {
             Project::All
-        } else if let Some(aggs) = self.aggregates()? {
-            Project::Aggs(aggs)
         } else {
-            let mut cols = Vec::new();
+            let mut items = Vec::new();
             loop {
-                cols.push(self.qualified()?);
+                items.push(self.expr()?);
+                // A name for the column, which nothing here uses.
+                if self.eat_word("as") { self.name()?; }
                 if !self.eat_sym(',') { break; }
             }
-            Project::Columns(cols)
+            Project::Exprs(items)
         };
         self.want_word("from")?;
-        let table = self.name()?;
+        let (table, alias) = self.table_and_alias()?;
         let join = self.join_clause()?;
         let filter = self.where_clause()?;
         let order = self.order_clause()?;
@@ -454,58 +697,16 @@ impl Parser {
         } else {
             None
         };
-        Ok(Stmt::Select { table, join, project, filter, order, limit })
-    }
-
-    /// A select list made only of COUNT, SUM, MIN and MAX. Anything else
-    /// leaves the parser where it was.
-    fn aggregates(&mut self) -> Result<Option<Vec<Agg>>> {
-        let save = self.at;
-        let mut out = Vec::new();
-        loop {
-            let Some(a) = self.one_aggregate()? else { self.at = save; return Ok(None) };
-            out.push(a);
-            if !self.eat_sym(',') { break; }
-        }
-        // Only a list that is entirely aggregates counts.
-        if let Some(Tok::Word(w)) = self.peek() {
-            if !w.eq_ignore_ascii_case("from") { self.at = save; return Ok(None); }
-        }
-        Ok(Some(out))
-    }
-
-    fn one_aggregate(&mut self) -> Result<Option<Agg>> {
-        let save = self.at;
-        let Some(Tok::Word(w)) = self.peek().cloned() else { return Ok(None) };
-        let func = match w.to_ascii_uppercase().as_str() {
-            "COUNT" => Func::Count,
-            "SUM" => Func::Sum,
-            "MIN" => Func::Min,
-            "MAX" => Func::Max,
-            _ => return Ok(None),
-        };
-        self.at += 1;
-        if !self.eat_sym('(') { self.at = save; return Ok(None); }
-        let arg = if self.eat_sym('*') { None } else { Some(self.qualified()?) };
-        if !self.eat_sym(')') { return Err(sql_err("I expected ) after the column")); }
-        if func != Func::Count && arg.is_none() {
-            return Err(sql_err("only COUNT can take a star"));
-        }
-        Ok(Some(Agg { func, arg }))
+        Ok(Stmt::Select { table, alias, join, project, filter, order, limit })
     }
 
     fn join_clause(&mut self) -> Result<Option<Join>> {
         self.eat_word("inner");
         if !self.eat_word("join") { return Ok(None); }
-        let table = self.name()?;
+        let (table, alias) = self.table_and_alias()?;
         self.want_word("on")?;
-        let left = self.qualified()?;
-        if self.peek() != Some(&Tok::Cmp(Cmp::Eq)) {
-            return Err(sql_err("a join is on one column being equal to another"));
-        }
-        self.at += 1;
-        let right = self.qualified()?;
-        Ok(Some(Join { table, left, right }))
+        let on = self.expr()?;
+        Ok(Some(Join { table, alias, on }))
     }
 
     fn order_clause(&mut self) -> Result<Vec<Order>> {
@@ -513,9 +714,9 @@ impl Parser {
         self.want_word("by")?;
         let mut out = Vec::new();
         loop {
-            let name = self.qualified()?;
+            let expr = self.expr()?;
             let desc = if self.eat_word("desc") { true } else { self.eat_word("asc"); false };
-            out.push(Order { name, desc });
+            out.push(Order { expr, desc });
             if !self.eat_sym(',') { break; }
         }
         Ok(out)
@@ -545,47 +746,168 @@ impl Parser {
         Ok(Stmt::Delete { table, filter })
     }
 
-    /// Conditions joined by AND. OR waits for phase 4.
-    fn where_clause(&mut self) -> Result<Vec<Cond>> {
-        if !self.eat_word("where") { return Ok(Vec::new()); }
-        let mut out = Vec::new();
-        loop {
-            let column = self.qualified()?;
-            let cmp = match self.next() {
-                Some(Tok::Cmp(c)) => c,
-                _ => return Err(sql_err("I expected a comparison here")),
-            };
-            let value = self.expr()?;
-            out.push(Cond { column, cmp, value });
-            if !self.eat_word("and") { break; }
-        }
-        Ok(out)
+    fn where_clause(&mut self) -> Result<Option<Expr>> {
+        if !self.eat_word("where") { return Ok(None); }
+        Ok(Some(self.expr()?))
     }
 
-    fn expr(&mut self) -> Result<Expr> {
-        // A sign in front of a number belongs to the number. Two minus
-        // signs never reach here: the scanner reads them as a comment.
-        let mut neg = false;
-        loop {
-            if self.eat_sym('-') { neg = !neg; continue; }
-            if self.eat_sym('+') { continue; }
-            break;
+    // ── Expressions, loosest binding first ─────────────────────────────
+
+    fn expr(&mut self) -> Result<Expr> { self.or() }
+
+    fn or(&mut self) -> Result<Expr> {
+        let mut left = self.and()?;
+        while self.eat_word("or") {
+            let right = self.and()?;
+            left = Expr::Bin(Box::new(left), Op::Or, Box::new(right));
         }
-        if neg {
-            return match self.next() {
-                Some(Tok::Int(i)) => Ok(Expr::Lit(Value::Int(-i))),
-                Some(Tok::Real(r)) => Ok(Expr::Lit(Value::Real(-r))),
-                _ => Err(sql_err("a minus sign has to be in front of a number")),
+        Ok(left)
+    }
+
+    fn and(&mut self) -> Result<Expr> {
+        let mut left = self.not()?;
+        while self.eat_word("and") {
+            let right = self.not()?;
+            left = Expr::Bin(Box::new(left), Op::And, Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn not(&mut self) -> Result<Expr> {
+        if self.eat_word("not") {
+            return Ok(Expr::Not(Box::new(self.not()?)));
+        }
+        self.comparison()
+    }
+
+    fn comparison(&mut self) -> Result<Expr> {
+        let left = self.additive()?;
+        if self.eat_word("is") {
+            let not = self.eat_word("not");
+            self.want_word("null")?;
+            return Ok(Expr::IsNull(Box::new(left), not));
+        }
+        let save = self.at;
+        let not = self.eat_word("not");
+        if self.eat_word("between") {
+            let low = self.additive()?;
+            self.want_word("and")?;
+            let high = self.additive()?;
+            return Ok(Expr::Between { what: Box::new(left), low: Box::new(low), high: Box::new(high), not });
+        }
+        self.at = save;
+        if let Some(Tok::Cmp(c)) = self.peek().cloned() {
+            self.at += 1;
+            let right = self.additive()?;
+            return Ok(Expr::Bin(Box::new(left), Op::Cmp(c), Box::new(right)));
+        }
+        Ok(left)
+    }
+
+    fn additive(&mut self) -> Result<Expr> {
+        let mut left = self.multiplicative()?;
+        loop {
+            let op = if self.eat_sym('+') {
+                Op::Add
+            } else if self.eat_sym('-') {
+                Op::Sub
+            } else {
+                break;
             };
+            let right = self.multiplicative()?;
+            left = Expr::Bin(Box::new(left), op, Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn multiplicative(&mut self) -> Result<Expr> {
+        let mut left = self.unary()?;
+        loop {
+            let op = if self.eat_sym('*') {
+                Op::Mul
+            } else if self.eat_sym('/') {
+                Op::Div
+            } else {
+                break;
+            };
+            let right = self.unary()?;
+            left = Expr::Bin(Box::new(left), op, Box::new(right));
+        }
+        Ok(left)
+    }
+
+    fn unary(&mut self) -> Result<Expr> {
+        if self.eat_sym('-') {
+            // A minus in front of a number belongs to the number.
+            return Ok(match self.unary()? {
+                Expr::Lit(Value::Int(i)) => Expr::Lit(Value::Int(-i)),
+                Expr::Lit(Value::Real(r)) => Expr::Lit(Value::Real(-r)),
+                other => Expr::Bin(Box::new(Expr::Lit(Value::Int(0))), Op::Sub, Box::new(other)),
+            });
+        }
+        if self.eat_sym('+') {
+            return self.unary();
+        }
+        self.primary()
+    }
+
+    fn primary(&mut self) -> Result<Expr> {
+        if self.eat_sym('(') {
+            let inner = self.expr()?;
+            self.want_sym(')')?;
+            return Ok(inner);
         }
         match self.next() {
             Some(Tok::Int(i)) => Ok(Expr::Lit(Value::Int(i))),
             Some(Tok::Real(r)) => Ok(Expr::Lit(Value::Real(r))),
             Some(Tok::Str(s)) => Ok(Expr::Lit(Value::Text(s))),
             Some(Tok::Param(n)) => Ok(Expr::Param(n - 1)),
-            Some(Tok::Word(w)) if w.eq_ignore_ascii_case("null") => Ok(Expr::Lit(Value::Null)),
+            Some(Tok::Word(w)) => {
+                let up = w.to_ascii_uppercase();
+                if up == "NULL" { return Ok(Expr::Lit(Value::Null)); }
+                if up == "TRUE" { return Ok(Expr::Lit(Value::Int(1))); }
+                if up == "FALSE" { return Ok(Expr::Lit(Value::Int(0))); }
+                if self.eat_sym('(') { return self.call(&up); }
+                if self.eat_sym('.') {
+                    let column = self.name()?;
+                    return Ok(Expr::Column(Name { table: Some(w), column }));
+                }
+                Ok(Expr::Column(Name { table: None, column: w }))
+            }
             _ => Err(sql_err("I expected a value here")),
         }
+    }
+
+    /// The name has been read and the bracket is open.
+    fn call(&mut self, name: &str) -> Result<Expr> {
+        let func = match name {
+            "COUNT" => {
+                if self.eat_sym('*') {
+                    self.want_sym(')')?;
+                    return Ok(Expr::Agg(Func::Count, None));
+                }
+                Some(Func::Count)
+            }
+            "SUM" => Some(Func::Sum),
+            "MIN" => Some(Func::Min),
+            "MAX" => Some(Func::Max),
+            _ => None,
+        };
+        if let Some(func) = func {
+            let arg = self.expr()?;
+            self.want_sym(')')?;
+            return Ok(Expr::Agg(func, Some(Box::new(arg))));
+        }
+        if name == "COALESCE" || name == "IFNULL" {
+            let mut args = Vec::new();
+            loop {
+                args.push(self.expr()?);
+                if !self.eat_sym(',') { break; }
+            }
+            self.want_sym(')')?;
+            return Ok(Expr::Coalesce(args));
+        }
+        Err(sql_err(&format!("I do not know a function called {name}")))
     }
 }
 
@@ -593,10 +915,21 @@ impl Parser {
 mod tests {
     use super::*;
 
+    fn col(n: &str) -> Expr { Expr::Column(Name::bare(n)) }
+    fn int(i: i64) -> Expr { Expr::Lit(Value::Int(i)) }
+    fn bin(a: Expr, op: Op, b: Expr) -> Expr { Expr::Bin(Box::new(a), op, Box::new(b)) }
+
+    fn filter_of(sql: &str) -> Expr {
+        match parse(sql).unwrap() {
+            Stmt::Select { filter, .. } => filter.unwrap(),
+            other => panic!("{other:?}"),
+        }
+    }
+
     #[test]
     fn a_create_says_which_column_is_the_key() {
         let s = parse("CREATE TABLE kv (id INTEGER PRIMARY KEY, a INT NOT NULL, c TEXT)").unwrap();
-        let Stmt::CreateTable { name, columns, if_missing } = s else { panic!() };
+        let Stmt::CreateTable { name, columns, if_missing, .. } = s else { panic!() };
         assert_eq!(name, "kv");
         assert!(!if_missing);
         assert_eq!(columns.len(), 3);
@@ -607,6 +940,38 @@ mod tests {
     }
 
     #[test]
+    fn a_create_can_spell_out_its_key_defaults_and_foreign_keys() {
+        let s = parse(
+            "CREATE TABLE ev (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                cal INTEGER NOT NULL,
+                color INTEGER DEFAULT 39,
+                status TEXT DEFAULT 'confirmed',
+                note VARCHAR(64) UNIQUE,
+                who INTEGER REFERENCES people(id),
+                FOREIGN KEY(cal) REFERENCES calendars(id) ON DELETE CASCADE
+            )",
+        )
+        .unwrap();
+        let Stmt::CreateTable { columns, foreign_keys, .. } = s else { panic!() };
+        assert_eq!(columns[2].default, Some(Value::Int(39)));
+        assert_eq!(columns[3].default, Some(Value::Text("confirmed".into())));
+        assert!(columns[4].unique);
+        assert_eq!(
+            foreign_keys,
+            vec![
+                ForeignKey { column: "who".into(), table: "people".into(), cascade: false },
+                ForeignKey { column: "cal".into(), table: "calendars".into(), cascade: true },
+            ]
+        );
+
+        let s = parse("CREATE TABLE w (date TEXT NOT NULL, hour INTEGER, PRIMARY KEY(date, hour), UNIQUE(hour))").unwrap();
+        let Stmt::CreateTable { key_columns, unique_sets, .. } = s else { panic!() };
+        assert_eq!(key_columns, vec!["date", "hour"]);
+        assert_eq!(unique_sets, vec![vec!["hour".to_string()]]);
+    }
+
+    #[test]
     fn keywords_do_not_care_about_case() {
         let a = parse("select * from kv").unwrap();
         let b = parse("SELECT * FROM kv").unwrap();
@@ -614,22 +979,28 @@ mod tests {
     }
 
     #[test]
-    fn an_insert_keeps_its_values_in_order() {
+    fn an_insert_keeps_its_values_in_order_and_knows_what_to_do_on_a_clash() {
         let s = parse("INSERT INTO kv (id, a, c) VALUES (?1, 7, 'hi')").unwrap();
-        let Stmt::Insert { table, columns, values } = s else { panic!() };
+        let Stmt::Insert { table, columns, values, on_conflict } = s else { panic!() };
         assert_eq!(table, "kv");
         assert_eq!(columns, vec!["id", "a", "c"]);
-        assert_eq!(values[0], Expr::Param(0));
-        assert_eq!(values[1], Expr::Lit(Value::Int(7)));
-        assert_eq!(values[2], Expr::Lit(Value::Text("hi".into())));
+        assert_eq!(values, vec![Expr::Param(0), int(7), Expr::Lit(Value::Text("hi".into()))]);
+        assert_eq!(on_conflict, OnConflict::Fail);
+        let Stmt::Insert { on_conflict, .. } = parse("INSERT OR IGNORE INTO kv (id) VALUES (1)").unwrap() else { panic!() };
+        assert_eq!(on_conflict, OnConflict::Ignore);
+        let Stmt::Insert { on_conflict, .. } = parse("INSERT OR REPLACE INTO kv (id) VALUES (1)").unwrap() else { panic!() };
+        assert_eq!(on_conflict, OnConflict::Replace);
     }
 
     #[test]
     fn a_bare_question_mark_counts_itself() {
         let s = parse("SELECT a FROM kv WHERE id = ? AND a = ?").unwrap();
-        let Stmt::Select { filter, .. } = s else { panic!() };
-        assert_eq!(filter[0].value, Expr::Param(0));
-        assert_eq!(filter[1].value, Expr::Param(1));
+        let Stmt::Select { filter, .. } = &s else { panic!() };
+        assert_eq!(
+            filter.clone().unwrap(),
+            bin(bin(col("id"), Op::Cmp(Cmp::Eq), Expr::Param(0)), Op::And, bin(col("a"), Op::Cmp(Cmp::Eq), Expr::Param(1)))
+        );
+        assert_eq!(s.params(), 2);
     }
 
     #[test]
@@ -638,90 +1009,98 @@ mod tests {
             ("=", Cmp::Eq), ("<>", Cmp::Ne), ("!=", Cmp::Ne),
             ("<", Cmp::Lt), ("<=", Cmp::Le), (">", Cmp::Gt), (">=", Cmp::Ge),
         ] {
-            let s = parse(&format!("SELECT a FROM kv WHERE id {text} 1")).unwrap();
-            let Stmt::Select { filter, .. } = s else { panic!() };
-            assert_eq!(filter[0].cmp, want, "{text}");
+            let f = filter_of(&format!("SELECT a FROM kv WHERE id {text} 1"));
+            assert_eq!(f, bin(col("id"), Op::Cmp(want), int(1)), "{text}");
         }
     }
 
     #[test]
-    fn a_number_can_be_negative() {
-        let Stmt::Select { filter, .. } = parse("SELECT a FROM kv WHERE a < -7").unwrap() else { panic!() };
-        assert_eq!(filter[0].value, Expr::Lit(Value::Int(-7)));
-        let Stmt::Select { filter, .. } = parse("SELECT a FROM kv WHERE b >= -1.5").unwrap() else { panic!() };
-        assert_eq!(filter[0].value, Expr::Lit(Value::Real(-1.5)));
-        let Stmt::Select { filter, .. } = parse("SELECT a FROM kv WHERE a = +3").unwrap() else { panic!() };
-        assert_eq!(filter[0].value, Expr::Lit(Value::Int(3)));
+    fn and_binds_tighter_than_or_and_brackets_win() {
+        let f = filter_of("SELECT a FROM kv WHERE a = 1 OR b = 2 AND c = 3");
+        let Expr::Bin(_, Op::Or, right) = f else { panic!("{f:?}") };
+        assert!(matches!(*right, Expr::Bin(_, Op::And, _)));
+        let f = filter_of("SELECT a FROM kv WHERE (a = 1 OR b = 2) AND c = 3");
+        let Expr::Bin(left, Op::And, _) = f else { panic!("{f:?}") };
+        assert!(matches!(*left, Expr::Bin(_, Op::Or, _)));
+        let parts = filter_of("SELECT a FROM kv WHERE a = 1 AND b = 2 AND c = 3").conjuncts();
+        assert_eq!(parts.len(), 3);
     }
 
     #[test]
-    fn a_minus_still_starts_a_comment() {
-        let s = parse("SELECT a FROM kv -- a < -7\n WHERE id = 1").unwrap();
-        let Stmt::Select { filter, .. } = s else { panic!() };
-        assert_eq!(filter.len(), 1);
+    fn is_null_between_and_not_all_parse() {
+        assert_eq!(filter_of("SELECT a FROM kv WHERE a IS NULL"), Expr::IsNull(Box::new(col("a")), false));
+        assert_eq!(filter_of("SELECT a FROM kv WHERE a IS NOT NULL"), Expr::IsNull(Box::new(col("a")), true));
+        assert_eq!(
+            filter_of("SELECT a FROM kv WHERE a BETWEEN 1 AND 5"),
+            Expr::Between { what: Box::new(col("a")), low: Box::new(int(1)), high: Box::new(int(5)), not: false }
+        );
+        assert_eq!(
+            filter_of("SELECT a FROM kv WHERE a NOT BETWEEN ?1 AND ?2"),
+            Expr::Between { what: Box::new(col("a")), low: Box::new(Expr::Param(0)), high: Box::new(Expr::Param(1)), not: true }
+        );
+        assert_eq!(filter_of("SELECT a FROM kv WHERE NOT a = 1"), Expr::Not(Box::new(bin(col("a"), Op::Cmp(Cmp::Eq), int(1)))));
+    }
+
+    #[test]
+    fn arithmetic_has_the_usual_order() {
+        let Stmt::Update { sets, .. } = parse("UPDATE kv SET a = 1 - a, b = 2 + 3 * 4").unwrap() else { panic!() };
+        assert_eq!(sets[0].1, bin(int(1), Op::Sub, col("a")));
+        assert_eq!(sets[1].1, bin(int(2), Op::Add, bin(int(3), Op::Mul, int(4))));
+    }
+
+    #[test]
+    fn a_number_can_be_negative_and_a_minus_still_starts_a_comment() {
+        assert_eq!(filter_of("SELECT a FROM kv WHERE a < -7"), bin(col("a"), Op::Cmp(Cmp::Lt), int(-7)));
+        assert_eq!(filter_of("SELECT a FROM kv WHERE b >= -1.5"), bin(col("b"), Op::Cmp(Cmp::Ge), Expr::Lit(Value::Real(-1.5))));
+        assert_eq!(filter_of("SELECT a FROM kv WHERE a = +3"), bin(col("a"), Op::Cmp(Cmp::Eq), int(3)));
+        assert_eq!(filter_of("SELECT a FROM kv -- a < -7\n WHERE id = 1"), bin(col("id"), Op::Cmp(Cmp::Eq), int(1)));
     }
 
     #[test]
     fn a_string_can_hold_a_quote() {
-        let s = parse("SELECT a FROM kv WHERE c = 'it''s'").unwrap();
-        let Stmt::Select { filter, .. } = s else { panic!() };
-        assert_eq!(filter[0].value, Expr::Lit(Value::Text("it's".into())));
+        assert_eq!(filter_of("SELECT a FROM kv WHERE c = 'it''s'"), bin(col("c"), Op::Cmp(Cmp::Eq), Expr::Lit(Value::Text("it's".into()))));
     }
 
     #[test]
-    fn select_takes_a_star_a_list_or_an_aggregate() {
+    fn a_select_list_takes_a_star_columns_expressions_and_aggregates() {
         let Stmt::Select { project, .. } = parse("SELECT * FROM kv").unwrap() else { panic!() };
         assert_eq!(project, Project::All);
         let Stmt::Select { project, .. } = parse("SELECT a, c FROM kv").unwrap() else { panic!() };
-        assert_eq!(project, Project::Columns(vec![Name::bare("a"), Name::bare("c")]));
-        let Stmt::Select { project, .. } = parse("SELECT COUNT(*) FROM kv").unwrap() else { panic!() };
-        assert_eq!(project, Project::Aggs(vec![Agg { func: Func::Count, arg: None }]));
-    }
-
-    #[test]
-    fn every_aggregate_parses() {
-        for (text, func) in [("SUM", Func::Sum), ("MIN", Func::Min), ("MAX", Func::Max)] {
-            let s = parse(&format!("SELECT {text}(a) FROM kv")).unwrap();
-            let Stmt::Select { project, .. } = s else { panic!() };
-            assert_eq!(project, Project::Aggs(vec![Agg { func, arg: Some(Name::bare("a")) }]));
+        assert_eq!(project, Project::Exprs(vec![col("a"), col("c")]));
+        let Stmt::Select { project, .. } = parse("SELECT COUNT(*) > 0, COALESCE(a, id) AS x FROM kv").unwrap() else { panic!() };
+        let Project::Exprs(items) = project else { panic!() };
+        assert_eq!(items[0], bin(Expr::Agg(Func::Count, None), Op::Cmp(Cmp::Gt), int(0)));
+        assert_eq!(items[1], Expr::Coalesce(vec![col("a"), col("id")]));
+        assert!(items[0].has_aggregate());
+        assert!(!items[1].has_aggregate());
+        for (text, func) in [("SUM", Func::Sum), ("MIN", Func::Min), ("MAX", Func::Max), ("COUNT", Func::Count)] {
+            let Stmt::Select { project, .. } = parse(&format!("SELECT {text}(a) FROM kv")).unwrap() else { panic!() };
+            assert_eq!(project, Project::Exprs(vec![Expr::Agg(func, Some(Box::new(col("a"))))]));
         }
-        let s = parse("SELECT COUNT(*), SUM(a), MIN(b), MAX(c) FROM kv").unwrap();
-        let Stmt::Select { project, .. } = s else { panic!() };
-        let Project::Aggs(aggs) = project else { panic!() };
-        assert_eq!(aggs.len(), 4);
-        // Only COUNT may take a star.
         assert!(parse("SELECT SUM(*) FROM kv").is_err());
         // A column called count is still a column.
-        let s = parse("SELECT count FROM kv").unwrap();
-        let Stmt::Select { project, .. } = s else { panic!() };
-        assert_eq!(project, Project::Columns(vec![Name::bare("count")]));
+        let Stmt::Select { project, .. } = parse("SELECT count FROM kv").unwrap() else { panic!() };
+        assert_eq!(project, Project::Exprs(vec![col("count")]));
     }
 
     #[test]
-    fn a_name_can_say_its_table() {
-        let s = parse("SELECT a.x, y FROM a WHERE a.z = 1").unwrap();
-        let Stmt::Select { project, filter, .. } = s else { panic!() };
+    fn a_name_can_say_its_table_and_a_table_can_have_a_short_name() {
+        let s = parse("SELECT e.title, c.name FROM events e JOIN calendars AS c ON c.id = e.calendar_id WHERE e.id = 1").unwrap();
+        let Stmt::Select { alias, join, project, .. } = s else { panic!() };
+        assert_eq!(alias.as_deref(), Some("e"));
+        let join = join.unwrap();
+        assert_eq!(join.table, "calendars");
+        assert_eq!(join.alias.as_deref(), Some("c"));
         assert_eq!(
             project,
-            Project::Columns(vec![
-                Name { table: Some("a".into()), column: "x".into() },
-                Name::bare("y"),
+            Project::Exprs(vec![
+                Expr::Column(Name { table: Some("e".into()), column: "title".into() }),
+                Expr::Column(Name { table: Some("c".into()), column: "name".into() }),
             ])
         );
-        assert_eq!(filter[0].column, Name { table: Some("a".into()), column: "z".into() });
-    }
-
-    #[test]
-    fn a_join_says_what_is_equal_to_what() {
-        let s = parse("SELECT a.x FROM a JOIN b ON a.k = b.id WHERE b.y > 1").unwrap();
-        let Stmt::Select { join, filter, .. } = s else { panic!() };
-        let join = join.unwrap();
-        assert_eq!(join.table, "b");
-        assert_eq!(join.left, Name { table: Some("a".into()), column: "k".into() });
-        assert_eq!(join.right, Name { table: Some("b".into()), column: "id".into() });
-        assert_eq!(filter.len(), 1);
+        let Stmt::Select { alias, .. } = parse("SELECT a FROM kv WHERE a = 1").unwrap() else { panic!() };
+        assert_eq!(alias, None);
         assert!(parse("SELECT x FROM a INNER JOIN b ON a.k = b.id").is_ok());
-        assert!(parse("SELECT x FROM a JOIN b ON a.k > b.id").is_err());
     }
 
     #[test]
@@ -736,56 +1115,58 @@ mod tests {
     }
 
     #[test]
-    fn an_index_is_made_and_dropped_by_name() {
+    fn an_index_can_cover_several_columns_and_be_unique() {
         let s = parse("CREATE INDEX kv_a ON kv (a)").unwrap();
         assert_eq!(
             s,
-            Stmt::CreateIndex {
-                name: "kv_a".into(),
-                table: "kv".into(),
-                column: "a".into(),
-                if_missing: false
-            }
+            Stmt::CreateIndex { name: "kv_a".into(), table: "kv".into(), columns: vec!["a".into()], unique: false, if_missing: false }
         );
-        let s = parse("CREATE UNIQUE INDEX IF NOT EXISTS kv_a ON kv (a DESC)").unwrap();
-        let Stmt::CreateIndex { if_missing, .. } = s else { panic!() };
-        assert!(if_missing);
+        let s = parse("CREATE UNIQUE INDEX IF NOT EXISTS kv_ab ON kv (a DESC, b)").unwrap();
+        let Stmt::CreateIndex { columns, unique, if_missing, .. } = s else { panic!() };
+        assert_eq!(columns, vec!["a", "b"]);
+        assert!(unique && if_missing);
         assert_eq!(parse("DROP INDEX kv_a").unwrap(), Stmt::DropIndex { name: "kv_a".into(), if_there: false });
         assert_eq!(parse("DROP INDEX IF EXISTS kv_a").unwrap(), Stmt::DropIndex { name: "kv_a".into(), if_there: true });
+        assert_eq!(parse("DROP TABLE IF EXISTS kv").unwrap(), Stmt::DropTable { name: "kv".into(), if_there: true });
     }
 
     #[test]
     fn an_update_takes_several_columns() {
         let s = parse("UPDATE kv SET a = ?1, c = 'x' WHERE id = ?2").unwrap();
+        assert_eq!(s.params(), 2);
         let Stmt::Update { sets, filter, .. } = s else { panic!() };
         assert_eq!(sets.len(), 2);
         assert_eq!(sets[0].1, Expr::Param(0));
-        assert_eq!(filter[0].value, Expr::Param(1));
+        assert_eq!(filter.unwrap(), bin(col("id"), Op::Cmp(Cmp::Eq), Expr::Param(1)));
     }
 
     #[test]
-    fn transactions_are_words_of_their_own() {
+    fn transactions_and_pragmas_are_words_of_their_own() {
         assert_eq!(parse("BEGIN").unwrap(), Stmt::Begin);
         assert_eq!(parse("BEGIN TRANSACTION").unwrap(), Stmt::Begin);
         assert_eq!(parse("COMMIT").unwrap(), Stmt::Commit);
         assert_eq!(parse("END").unwrap(), Stmt::Commit);
         assert_eq!(parse("ROLLBACK").unwrap(), Stmt::Rollback);
+        assert_eq!(parse("PRAGMA foreign_keys = ON").unwrap(), Stmt::Nothing);
+        assert_eq!(parse("PRAGMA journal_mode(WAL);").unwrap(), Stmt::Nothing);
     }
 
     #[test]
-    fn a_comment_runs_to_the_end_of_the_line() {
-        let s = parse("SELECT a FROM kv -- the rest of this is nothing\n WHERE id = 1").unwrap();
-        let Stmt::Select { filter, .. } = s else { panic!() };
-        assert_eq!(filter.len(), 1);
+    fn a_batch_is_cut_at_semicolons_but_not_inside_strings() {
+        let parts = split("CREATE TABLE a (x TEXT); INSERT INTO a VALUES ('one; two'); -- c; d\n SELECT * FROM a;");
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[1], "INSERT INTO a VALUES ('one; two')");
     }
 
     #[test]
     fn nonsense_comes_back_as_an_error_not_a_panic() {
         for bad in [
             "SELECT", "SELECT a FROM", "INSERT INTO kv VALUES", "WOBBLE kv",
-            "SELECT a FROM kv WHERE", "SELECT a FROM kv WHERE id", "CREATE TABLE kv (a WOBBLE)",
+            "SELECT a FROM kv WHERE", "SELECT a FROM kv WHERE id =", "CREATE TABLE kv (a WOBBLE)",
             "SELECT a FROM kv WHERE c = 'never closed", "SELECT a FROM kv; SELECT a FROM kv",
-            "SELECT a FROM kv LIMIT x", "SELECT a FROM kv WHERE id = ?0",
+            "SELECT a FROM kv LIMIT x", "SELECT a FROM kv WHERE id = ?0", "SELECT a FROM kv WHERE (a = 1",
+            "SELECT NOPE(a) FROM kv", "INSERT OR WOBBLE INTO kv (a) VALUES (1)",
+            "CREATE TABLE kv (a INTEGER DEFAULT b)",
         ] {
             assert!(parse(bad).is_err(), "{bad} should not parse");
         }

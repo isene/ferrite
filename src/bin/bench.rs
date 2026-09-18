@@ -465,7 +465,7 @@ fn phase2_gate(rows: u64, batches: u64, per_batch: u64) -> (f64, f64) {
         // and that was worth 10% on its own. So the two take turns going
         // first, and the advantage cancels out over the run.
         let plain_first = b % 2 == 0;
-        let mut run_plain = |plain: &mut Vec<u64>| {
+        let run_plain = |plain: &mut Vec<u64>| {
             let mut keys = Rng::new(100 + b);
             let t0 = Instant::now();
             let mut sum = 0i64;
@@ -476,7 +476,7 @@ fn phase2_gate(rows: u64, batches: u64, per_batch: u64) -> (f64, f64) {
             plain.push(t0.elapsed().as_nanos() as u64 / per_batch);
             sum
         };
-        let mut run_sql = |sql: &mut Vec<u64>| {
+        let run_sql = |sql: &mut Vec<u64>| {
             let mut keys = Rng::new(100 + b);
             let t0 = Instant::now();
             let mut sum = 0i64;
