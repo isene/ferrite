@@ -67,6 +67,9 @@ const BIG: u64 = 1 << 18;
 
 // ── Checksum ───────────────────────────────────────────────────────────
 
+/// The Castagnoli polynomial, which is the one the processor knows.
+const POLY: u32 = 0x82F6_3B78;
+
 fn table() -> &'static [u32; 256] {
     static TABLE: OnceLock<[u32; 256]> = OnceLock::new();
     TABLE.get_or_init(|| {
@@ -74,7 +77,7 @@ fn table() -> &'static [u32; 256] {
         for (i, slot) in t.iter_mut().enumerate() {
             let mut c = i as u32;
             for _ in 0..8 {
-                c = if c & 1 != 0 { 0xEDB8_8320 ^ (c >> 1) } else { c >> 1 };
+                c = if c & 1 != 0 { POLY ^ (c >> 1) } else { c >> 1 };
             }
             *slot = c;
         }
@@ -82,15 +85,56 @@ fn table() -> &'static [u32; 256] {
     })
 }
 
-/// The usual CRC32, so a torn or rotted record is spotted rather than
-/// read as data.
+/// A checksum over every record, so a torn or rotted one is spotted
+/// rather than read as data.
+///
+/// This is CRC32C, not the CRC32 in a zip file. They differ only in one
+/// constant, and this one is an instruction on every x86-64 chip made
+/// since 2008, which turns out to matter: a bulk load of a hundred
+/// thousand rows spent 23 of its 26 milliseconds here when this was a
+/// table in memory.
 pub fn crc32(bytes: &[u8]) -> u32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        static FAST: OnceLock<bool> = OnceLock::new();
+        if *FAST.get_or_init(|| std::arch::is_x86_feature_detected!("sse4.2")) {
+            // Safe: only reached when the processor has said it has the
+            // instruction.
+            return unsafe { by_instruction(bytes) };
+        }
+    }
+    by_table(bytes)
+}
+
+/// The same answer, worked out a byte at a time. Used where the
+/// instruction is not there, and in a test against the one that is.
+pub fn by_table(bytes: &[u8]) -> u32 {
     let t = table();
     let mut c = 0xFFFF_FFFFu32;
     for b in bytes {
         c = t[((c ^ *b as u32) & 0xFF) as usize] ^ (c >> 8);
     }
     c ^ 0xFFFF_FFFF
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "sse4.2")]
+unsafe fn by_instruction(bytes: &[u8]) -> u32 {
+    use std::arch::x86_64::{_mm_crc32_u64, _mm_crc32_u8};
+    let mut c = 0xFFFF_FFFFu64;
+    // Eight bytes at a time through the middle, one at a time at each
+    // end where the alignment does not work out.
+    let (head, middle, tail) = bytes.align_to::<u64>();
+    for b in head {
+        c = _mm_crc32_u8(c as u32, *b) as u64;
+    }
+    for w in middle {
+        c = _mm_crc32_u64(c, *w);
+    }
+    for b in tail {
+        c = _mm_crc32_u8(c as u32, *b) as u64;
+    }
+    (c as u32) ^ 0xFFFF_FFFF
 }
 
 // ── What a commit records ──────────────────────────────────────────────
@@ -680,9 +724,31 @@ mod tests {
     }
 
     #[test]
-    fn the_checksum_is_the_usual_one() {
+    fn the_checksum_is_the_one_it_says_it_is() {
+        // The value everyone checks CRC32C against.
         assert_eq!(crc32(b""), 0);
-        assert_eq!(crc32(b"123456789"), 0xCBF4_3926);
+        assert_eq!(crc32(b"123456789"), 0xE306_9283);
+        assert_eq!(by_table(b"123456789"), 0xE306_9283);
+    }
+
+    #[test]
+    fn the_instruction_and_the_table_agree() {
+        let mut rng: u64 = 0x1234_5678;
+        for len in 0..600 {
+            let bytes: Vec<u8> = (0..len)
+                .map(|_| {
+                    rng ^= rng << 13;
+                    rng ^= rng >> 7;
+                    rng ^= rng << 17;
+                    rng as u8
+                })
+                .collect();
+            assert_eq!(crc32(&bytes), by_table(&bytes), "they differ at {len} bytes");
+            // And on a slice that does not start on a word boundary.
+            if len > 3 {
+                assert_eq!(crc32(&bytes[3..]), by_table(&bytes[3..]), "offset, {len} bytes");
+            }
+        }
     }
 
     #[test]

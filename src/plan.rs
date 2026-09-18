@@ -615,6 +615,15 @@ impl Statement {
                 }
             }
         }
+        // A query that asks only for the key, found through an index,
+        // is already answered by the index: it holds the keys. Fetching
+        // each row to read back the key it was filed under is a walk
+        // down the row tree for nothing.
+        if let What::Row(picks) = what {
+            if let Some(rows) = keys_from_index(db, join, picks, filter, order, *limit, params)? {
+                return Ok(Outcome::Rows(rows));
+            }
+        }
         match what {
             What::Aggs(aggs) => {
                 let mut state: Vec<AggState> =
@@ -775,6 +784,46 @@ impl Statement {
         }
         Ok(())
     }
+}
+
+/// The rows of a query that wants nothing but the key and finds them
+/// through an index. None when the query is not of that shape.
+#[allow(clippy::too_many_arguments)]
+fn keys_from_index(
+    db: &Db,
+    join: &Option<Joined>,
+    picks: &[Pick],
+    filter: &Where,
+    order: &[Sort],
+    limit: Option<usize>,
+    params: &[Value],
+) -> Result<Option<Vec<Row>>> {
+    if join.is_some() || !filter.tests.is_empty() || picks.is_empty() {
+        return Ok(None);
+    }
+    if !picks.iter().all(|p| *p == Pick::Key(0)) {
+        return Ok(None);
+    }
+    // The keys come out of the index in order, so sorting by the key is
+    // free and anything else is not.
+    let desc = match order {
+        [] => false,
+        [one] if one.pick == Pick::Key(0) => one.desc,
+        _ => return Ok(None),
+    };
+    let Find::Index { index, value } = &filter.find else { return Ok(None) };
+    let value = value_of(value, params)?;
+    let mut out = Vec::new();
+    if *value == Value::Null { return Ok(Some(out)); }
+    let Some(keys) = db.index(*index).keys_for(value) else { return Ok(Some(out)) };
+    let cap = limit.unwrap_or(usize::MAX);
+    let mut push = |k: i64| out.push(vec![Value::Int(k); picks.len()]);
+    if desc {
+        keys.iter().rev().take(cap).for_each(|k| push(*k));
+    } else {
+        keys.iter().take(cap).for_each(|k| push(*k));
+    }
+    Ok(Some(out))
 }
 
 /// How many rows a WHERE picks out, when that can be answered without
@@ -1303,6 +1352,50 @@ mod tests {
             .map(|r| r[0].as_int().unwrap())
             .collect();
         assert_eq!(with, without);
+    }
+
+    #[test]
+    fn asking_only_for_the_key_gives_the_same_rows_either_way() {
+        let mut db = kv();
+        db.execute("UPDATE kv SET a = 50 WHERE id = 7", &[]).unwrap();
+        db.execute("UPDATE kv SET a = 50 WHERE id = 2", &[]).unwrap();
+        let walked: Vec<i64> = db
+            .query("SELECT id FROM kv WHERE a = 50", &[])
+            .unwrap()
+            .rows()
+            .iter()
+            .map(|r| r[0].as_int().unwrap())
+            .collect();
+        db.execute("CREATE INDEX kv_a ON kv (a)", &[]).unwrap();
+        let covered: Vec<i64> = db
+            .query("SELECT id FROM kv WHERE a = 50", &[])
+            .unwrap()
+            .rows()
+            .iter()
+            .map(|r| r[0].as_int().unwrap())
+            .collect();
+        assert_eq!(covered, walked);
+        assert_eq!(covered, vec![2, 5, 7]);
+        // Sorted the other way, and cut short.
+        let down: Vec<i64> = db
+            .query("SELECT id FROM kv WHERE a = 50 ORDER BY id DESC LIMIT 2", &[])
+            .unwrap()
+            .rows()
+            .iter()
+            .map(|r| r[0].as_int().unwrap())
+            .collect();
+        assert_eq!(down, vec![7, 5]);
+        // Asking for the key twice gives it twice.
+        let twice = db.query("SELECT id, id FROM kv WHERE a = 50", &[]).unwrap();
+        assert_eq!(twice.rows()[0], vec![Value::Int(2), Value::Int(2)]);
+        // Asking for anything else still goes to the rows.
+        let c = db.query("SELECT c FROM kv WHERE a = 50", &[]).unwrap();
+        assert_eq!(c.rows().len(), 3);
+        assert_eq!(c.rows()[0], vec![Value::Text("row 2".into())]);
+        // And a test on another column is still applied.
+        let some = db.query("SELECT id FROM kv WHERE a = 50 AND id > 3", &[]).unwrap();
+        let ids: Vec<i64> = some.rows().iter().map(|r| r[0].as_int().unwrap()).collect();
+        assert_eq!(ids, vec![5, 7]);
     }
 
     #[test]

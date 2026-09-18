@@ -278,6 +278,60 @@ when the statement is prepared, index and all. One prepared before an
 index was made still answers correctly, and still walks the table.
 Prepare it again to pick the index up.
 
+## Phase 5: speed, one measured step at a time
+
+### The checksum was most of a commit
+
+A bulk load of 100,000 rows spent 23 of its 26 milliseconds working out
+a checksum. The profiler named it, so it got the instruction.
+
+CRC32C is the same idea as the CRC32 in a zip file with one constant
+changed, and it has been a single x86-64 instruction since 2008. Over
+5 MB: **23.1 ms by a table in memory, 1.5 ms by the instruction.**
+
+| | before | after |
+|---|---|---|
+| writing a 4.9 MB commit | 26 ms | 5 ms |
+| a bulk load, all of it | 955 ns a row | 711 ns |
+| bulk insert, NORMAL | 1 435 231 /s | 1 864 413 /s |
+| bulk insert, FULL | 1 112 358 /s | 1 720 541 /s |
+
+SQLite does 1 261 124 and 1 184 987. The table version is still there
+and still tested against the instruction, for a processor without it.
+
+### A query that wants only the key never needs the rows
+
+| asking for | before | after | SQLite |
+|---|---|---|---|
+| the key only | 256 µs | 48 µs | 68 µs |
+| a number | 363 µs | 363 µs | 67 µs |
+| a string | 500 µs | 500 µs | 434 µs |
+
+An index already holds the keys, so `SELECT id FROM t WHERE a = ?` is
+answered without touching a row.
+
+**SQLite is still five times quicker at fetching the indexed column
+itself**, and that gap is going to stay. Its index holds the value
+beside the key, so `SELECT a FROM t WHERE a = ?` is covered too.
+
+ferrite's index files keys under a value, and two different values can
+share an entry: 5 and 5.0 compare equal, as SQL says they must. So the
+entry cannot say which of them a row holds, and reading the column off
+the index would sometimes hand back the wrong one.
+
+Storing each row's own value beside its key would fix it, and cost a
+value per indexed row.
+
+**Fetching a real column is within 15% of SQLite**, once the string
+copying is taken out: 363 µs against 434 for the same work plus a
+string.
+
+### What was left alone
+
+The plan lists an adaptive radix tree and an arena for rows. Neither has
+a measurement asking for it. Point reads are five times SQLite already
+and bulk insert is ahead, so both would be work on a guess.
+
 ## A trap this bench fell into
 
 The first run reported a 3 µs fsync and near-identical FULL and NORMAL

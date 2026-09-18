@@ -3,7 +3,7 @@
 An embedded SQL database in Rust, built to beat SQLite at small reads and
 writes. Part of the [Fe2O3](https://github.com/isene/fe2o3) suite.
 
-**Status:** phase 4 done. There is nothing to install yet. The plan is
+**Status:** phase 5 under way. There is nothing to install yet. The plan is
 in [PLAN.md](PLAN.md) and the numbers are in [BASELINE.md](BASELINE.md).
 
 ## Read this before you store anything you care about

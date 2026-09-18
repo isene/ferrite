@@ -73,3 +73,20 @@ fn where_the_time_goes() {
     let _ = std::fs::remove_dir_all(&path);
     let _ = std::fs::remove_dir_all(&path2);
 }
+
+#[test]
+#[ignore]
+fn what_the_checksum_costs() {
+    use std::time::Instant;
+    let bytes = vec![0x5Au8; 5 << 20];
+    let t0 = Instant::now();
+    let mut sum = 0u32;
+    for _ in 0..10 { sum ^= ferrite::log::crc32(&bytes); }
+    let each = t0.elapsed().as_secs_f64() / 10.0;
+    println!(
+        "\nchecksum over {:.1} MB: {:.1} ms, {:.2} bytes a nanosecond (sum {sum:x})",
+        bytes.len() as f64 / (1 << 20) as f64,
+        each * 1e3,
+        bytes.len() as f64 / (each * 1e9)
+    );
+}

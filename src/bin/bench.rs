@@ -509,12 +509,21 @@ fn phase2_gate(rows: u64, batches: u64, per_batch: u64) -> (f64, f64) {
 /// Without one there is nothing to do but look at every row, so the cost
 /// grows with the table. With one it is a lookup and then only the rows
 /// that matched.
-fn index_gain(rows: u64) -> Vec<(&'static str, f64, f64)> {
+fn index_gain(rows: u64) -> Vec<(&'static str, &'static str, f64, f64)> {
     use ferrite::{Db, Value};
 
     // A hundred values, so each one picks out about a thousandth of the
     // table.
     let spread = 100u64;
+    // Two questions. One asks only for the key, which an index already
+    // holds, so it can be answered without touching a row. The other
+    // asks for a column, so the row has to be fetched. Measuring only
+    // the first would have flattered whichever engine covers it.
+    let asks = [
+        ("the key only", "SELECT id FROM kv WHERE a = ?1"),
+        ("a number", "SELECT a FROM kv WHERE a = ?1"),
+        ("a string", "SELECT c FROM kv WHERE a = ?1"),
+    ];
     let mut out = Vec::new();
 
     let mut db = Db::new();
@@ -522,17 +531,16 @@ fn index_gain(rows: u64) -> Vec<(&'static str, f64, f64)> {
     let put = db.prepare("INSERT INTO kv (id, a, c) VALUES (?1, ?2, ?3)").unwrap();
     db.execute("BEGIN", &[]).unwrap();
     for i in 0..rows {
-        put.run(&mut db, &[Value::Int(i as i64), Value::Int((i % spread) as i64), Value::Text(format!("row {i}"))])
-            .unwrap();
+        put.run(
+            &mut db,
+            &[Value::Int(i as i64), Value::Int((i % spread) as i64), Value::Text(format!("row {i}"))],
+        )
+        .unwrap();
     }
     db.execute("COMMIT", &[]).unwrap();
-    // Rows, not a count. A count off an index is a special case that
-    // ferrite answers by reading how many keys are filed under a value,
-    // and measuring that would say nothing about ordinary work.
-    let sql = "SELECT id FROM kv WHERE a = ?1";
-    let ask = db.prepare(sql).unwrap();
 
-    let mut timed = |db: &Db, ask: &ferrite::Statement, ops: u64| -> f64 {
+    let timed = |db: &Db, sql: &str, ops: u64| -> f64 {
+        let ask = db.prepare(sql).unwrap();
         let mut rng = Rng::new(7);
         let t0 = Instant::now();
         for _ in 0..ops {
@@ -541,17 +549,13 @@ fn index_gain(rows: u64) -> Vec<(&'static str, f64, f64)> {
         }
         t0.elapsed().as_nanos() as f64 / ops as f64 / 1000.0
     };
-    let walked = timed(&db, &ask, 200);
+    let walked: Vec<f64> = asks.iter().map(|(_, sql)| timed(&db, sql, 200)).collect();
     db.execute("CREATE INDEX kv_a ON kv (a)", &[]).unwrap();
-    // A plan is fixed when the statement is prepared, so one prepared
-    // before the index knows nothing about it. Prepare it again.
-    // Rows, not a count. A count off an index is a special case that
-    // ferrite answers by reading how many keys are filed under a value,
-    // and measuring that would say nothing about ordinary work.
-    let sql = "SELECT id FROM kv WHERE a = ?1";
-    let ask = db.prepare(sql).unwrap();
-    let looked = timed(&db, &ask, 5_000);
-    out.push(("ferrite", walked, looked));
+    for (i, (what, sql)) in asks.iter().enumerate() {
+        // A plan is settled when the statement is prepared, so this one
+        // is prepared again now that there is an index.
+        out.push(("ferrite", *what, walked[i], timed(&db, sql, 5_000)));
+    }
 
     // The same on SQLite, so the gain is not just ours to claim.
     let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -564,8 +568,8 @@ fn index_gain(rows: u64) -> Vec<(&'static str, f64, f64)> {
         }
     }
     conn.execute_batch("COMMIT").unwrap();
-    let mut their_time = |ops: u64| -> f64 {
-        let mut ask = conn.prepare("SELECT id FROM kv WHERE a = ?1").unwrap();
+    let their_time = |sql: &str, ops: u64| -> f64 {
+        let mut ask = conn.prepare(sql).unwrap();
         let mut rng = Rng::new(7);
         let t0 = Instant::now();
         for _ in 0..ops {
@@ -575,10 +579,11 @@ fn index_gain(rows: u64) -> Vec<(&'static str, f64, f64)> {
         }
         t0.elapsed().as_nanos() as f64 / ops as f64 / 1000.0
     };
-    let their_walk = their_time(200);
+    let their_walk: Vec<f64> = asks.iter().map(|(_, sql)| their_time(sql, 200)).collect();
     conn.execute_batch("CREATE INDEX kv_a ON kv (a)").unwrap();
-    let their_look = their_time(5_000);
-    out.push(("SQLite", their_walk, their_look));
+    for (i, (what, sql)) in asks.iter().enumerate() {
+        out.push(("SQLite", *what, their_walk[i], their_time(sql, 5_000)));
+    }
     out
 }
 
@@ -855,9 +860,15 @@ fn main() {
     // What an index is for.
     let gain = index_gain(ROWS);
     println!("\nA lookup on a column that is not the key, {ROWS} rows, one value in a hundred");
-    println!("  {:<10}{:>14}{:>14}{:>10}", "engine", "walking µs", "indexed µs", "times");
-    for (who, walked, looked) in gain.iter() {
-        println!("  {:<10}{:>14.1}{:>14.2}{:>10.0}", who, walked, looked, walked / looked);
+    println!(
+        "  {:<10}{:<16}{:>12}{:>12}{:>9}",
+        "engine", "asking for", "walking µs", "indexed µs", "times"
+    );
+    for (who, what, walked, looked) in gain.iter() {
+        println!(
+            "  {:<10}{:<16}{:>12.1}{:>12.2}{:>9.0}",
+            who, what, walked, looked, walked / looked
+        );
     }
 }
 
