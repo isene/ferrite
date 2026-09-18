@@ -108,6 +108,50 @@ one measured step at a time, so it stays as it is until then.
 stops there, while SQLite writes to a disk. Phase 3 adds the log, and
 those two rows will fall. Compare them then, not now.
 
+## Phase 2: SQL
+
+A hand-written scanner and parser, planning done once, and statements
+kept and run many times.
+
+| workload | plain Rust | through SQL |
+|---|---|---|
+| bulk insert | 3 101 699 /s | 2 355 727 /s |
+| all reads | 2 084 424 /s | 1 786 465 /s |
+| 95/5 read-update | 2 800 138 /s | 2 195 300 /s |
+| 50/50 read-update | 2 416 769 /s | 1 629 909 /s |
+
+**The gate is met.** A prepared lookup by key measures 250 ns against
+the direct call's 285 ns, with the two running in alternating batches
+over the same rows.
+
+Read that as "planning costs less than this bench can resolve", not as
+"SQL is faster than not using SQL". A random lookup in 100,000 rows is
+mostly waiting for memory, and 35 ns of the 285 is inside the noise that
+code layout moves about. The gate asked for within 10%, and nothing here
+is slower.
+
+The two tables above tell a different story from the gate, because they
+were measured minutes apart while the machine drifted. That is why the
+gate has its own measurement.
+
+### Random SQL against SQLite
+
+60,000 generated statements over eleven seeds, with 60,000 answers
+compared. Every one matches SQLite.
+
+It found four real faults, none of which a hand-written test had caught:
+
+- A negative number would not parse at all.
+- `SELECT COUNT(*) ... LIMIT 2` counted two rows instead of counting all
+  of them and then returning one row.
+- `WHERE id = 4 AND id > 6` threw the second condition away and returned
+  row 4.
+- `WHERE id > 6 AND id < 3` asked a B-tree for a backwards range and
+  brought the process down.
+
+One difference is on purpose: SQLite will put a string in an INTEGER
+column, and ferrite refuses.
+
 ## A trap this bench fell into
 
 The first run reported a 3 µs fsync and near-identical FULL and NORMAL

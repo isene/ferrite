@@ -20,6 +20,11 @@
 //! assert_eq!(db.table(kv).get(1).unwrap()[0], Value::Int(7));
 //! ```
 
+pub mod plan;
+pub mod sql;
+
+pub use plan::{Outcome, Statement};
+
 use std::collections::{BTreeMap, HashMap};
 
 // ── Values ─────────────────────────────────────────────────────────────
@@ -110,6 +115,8 @@ pub enum Error {
     NoColumn(usize),
     /// A null in a column that does not allow one.
     NotNull(String),
+    /// The SQL could not be read, or asks for something that is not there.
+    Sql(String),
 }
 
 impl std::fmt::Display for Error {
@@ -127,6 +134,7 @@ impl std::fmt::Display for Error {
             }
             Error::NoColumn(i) => write!(f, "there is no column {i}"),
             Error::NotNull(c) => write!(f, "column {c} cannot be empty"),
+            Error::Sql(s) => write!(f, "{s}"),
         }
     }
 }
@@ -157,12 +165,16 @@ pub type Row = Vec<Value>;
 #[derive(Debug, Clone)]
 pub struct Table {
     name: String,
+    /// What the primary key is called in SQL. The key is not stored in
+    /// the row; it is what the row is filed under.
+    key: String,
     columns: Vec<Column>,
     rows: BTreeMap<i64, Row>,
 }
 
 impl Table {
     pub fn name(&self) -> &str { &self.name }
+    pub fn key_name(&self) -> &str { &self.key }
     pub fn columns(&self) -> &[Column] { &self.columns }
     pub fn len(&self) -> usize { self.rows.len() }
     pub fn is_empty(&self) -> bool { self.rows.is_empty() }
@@ -225,9 +237,11 @@ impl Table {
         self.rows.iter().map(|(k, r)| (*k, r))
     }
 
-    /// The rows whose keys fall in a range, in order.
+    /// The rows whose keys fall in a range, in order. A range that ends
+    /// before it starts holds nothing, rather than being a mistake:
+    /// `WHERE id > 6 AND id < 3` is a fair question with no answer.
     pub fn range(&self, from: i64, to: i64) -> impl Iterator<Item = (i64, &Row)> {
-        self.rows.range(from..to).map(|(k, r)| (*k, r))
+        self.rows.range(from..to.max(from)).map(|(k, r)| (*k, r))
     }
 
     fn check(&self, row: &Row) -> Result<()> {
@@ -265,6 +279,21 @@ pub struct TableId(usize);
 pub struct Db {
     tables: Vec<Table>,
     by_name: HashMap<String, usize>,
+    /// True between BEGIN and COMMIT.
+    in_txn: bool,
+    /// What to put back if the transaction is rolled back, newest last.
+    /// Nothing is recorded outside a transaction, so the usual path
+    /// costs one boolean test.
+    undo: Vec<Undo>,
+}
+
+/// One step backwards.
+#[derive(Debug)]
+enum Undo {
+    /// The row was not there before: take it out again.
+    Added(TableId, i64),
+    /// The row was there before: put it back as it was.
+    Was(TableId, i64, Option<Row>),
 }
 
 impl Db {
@@ -277,15 +306,20 @@ impl Db {
             .iter()
             .map(|(n, k)| Column { name: (*n).to_string(), kind: *k, null_ok: true })
             .collect();
-        self.create_table_full(name, columns)
+        self.create_table_full(name, "id", columns)
     }
 
-    pub fn create_table_full(&mut self, name: &str, columns: Vec<Column>) -> Result<TableId> {
+    pub fn create_table_full(&mut self, name: &str, key: &str, columns: Vec<Column>) -> Result<TableId> {
         if self.by_name.contains_key(name) {
             return Err(Error::TableExists(name.to_string()));
         }
         let id = TableId(self.tables.len());
-        self.tables.push(Table { name: name.to_string(), columns, rows: BTreeMap::new() });
+        self.tables.push(Table {
+            name: name.to_string(),
+            key: key.to_string(),
+            columns,
+            rows: BTreeMap::new(),
+        });
         self.by_name.insert(name.to_string(), id.0);
         Ok(id)
     }
@@ -303,6 +337,70 @@ impl Db {
 
     pub fn table_names(&self) -> impl Iterator<Item = &str> {
         self.tables.iter().map(|t| t.name.as_str())
+    }
+
+    // ── SQL ────────────────────────────────────────────────────────────
+
+    /// Read and plan a statement, ready to run many times.
+    pub fn prepare(&self, sql: &str) -> Result<Statement> { plan::plan(self, sql) }
+
+    /// Read, plan and run a statement that only reads. It takes the
+    /// database without asking to change it, so a reader needs no
+    /// mutable borrow.
+    pub fn query(&self, sql: &str, params: &[Value]) -> Result<Outcome> {
+        plan::plan(self, sql)?.query(self, params)
+    }
+
+    /// Read, plan and run a statement once. Fine for a one-off; for
+    /// anything in a loop, prepare it and keep it.
+    pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<Outcome> {
+        let stmt = plan::plan(self, sql)?;
+        if matches!(stmt.kind(), plan::Kind2::Reads) {
+            stmt.query(self, params)
+        } else {
+            stmt.run(self, params)
+        }
+    }
+
+    // ── Transactions ───────────────────────────────────────────────────
+
+    pub fn begin(&mut self) {
+        self.in_txn = true;
+        self.undo.clear();
+    }
+
+    pub fn commit(&mut self) {
+        self.in_txn = false;
+        self.undo.clear();
+    }
+
+    /// Put everything back the way it was at BEGIN.
+    pub fn rollback(&mut self) {
+        self.in_txn = false;
+        while let Some(step) = self.undo.pop() {
+            match step {
+                Undo::Added(id, key) => { self.tables[id.0].rows.remove(&key); }
+                Undo::Was(id, key, Some(row)) => { self.tables[id.0].rows.insert(key, row); }
+                Undo::Was(id, key, None) => { self.tables[id.0].rows.remove(&key); }
+            }
+        }
+    }
+
+    pub fn in_transaction(&self) -> bool { self.in_txn }
+
+    /// Remember that a row has just been added.
+    #[inline]
+    pub(crate) fn note_insert(&mut self, table: TableId, key: i64) {
+        if self.in_txn { self.undo.push(Undo::Added(table, key)); }
+    }
+
+    /// Remember what a row looked like before it is changed or removed.
+    #[inline]
+    pub(crate) fn note_change(&mut self, table: TableId, key: i64) {
+        if self.in_txn {
+            let was = self.tables[table.0].rows.get(&key).cloned();
+            self.undo.push(Undo::Was(table, key, was));
+        }
     }
 
     /// Throw a table away, with everything in it.
@@ -385,6 +483,7 @@ mod tests {
         let id = db
             .create_table_full(
                 "t",
+                "id",
                 vec![Column { name: "a".into(), kind: Kind::Int, null_ok: false }],
             )
             .unwrap();

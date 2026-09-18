@@ -230,7 +230,7 @@ mod sqlite {
 
 mod engine {
     use super::*;
-    use ferrite::{Db, Kind, TableId, Value};
+    use ferrite::{Db, Kind, Statement, TableId, Value};
 
     pub struct Ferrite {
         db: Db,
@@ -245,6 +245,97 @@ mod engine {
                 .create_table("kv", &[("a", Kind::Int), ("b", Kind::Real), ("c", Kind::Text)])
                 .expect("create");
             Ferrite { db, kv, rows: 0 }
+        }
+    }
+
+    /// The same engine reached through SQL, with every statement
+    /// prepared once. The phase 2 gate is that this row costs within 10%
+    /// of the plain Rust one.
+    pub struct FerriteSql {
+        db: Db,
+        rows: u64,
+        put: Statement,
+        get: Statement,
+        set: Statement,
+    }
+
+    impl FerriteSql {
+        pub fn open() -> FerriteSql {
+            let mut db = Db::new();
+            db.execute(
+                "CREATE TABLE kv (id INTEGER PRIMARY KEY, a INTEGER, b REAL, c TEXT)",
+                &[],
+            )
+            .expect("create");
+            let put = db.prepare("INSERT INTO kv (id, a, b, c) VALUES (?1, ?2, ?3, ?4)").unwrap();
+            let get = db.prepare("SELECT a FROM kv WHERE id = ?1").unwrap();
+            let set = db.prepare("UPDATE kv SET a = ?2 WHERE id = ?1").unwrap();
+            assert!(get.is_point_lookup(), "the lookup did not plan as a point lookup");
+            FerriteSql { db, rows: 0, put, get, set }
+        }
+    }
+
+    impl Engine for FerriteSql {
+        fn name(&self) -> String {
+            format!("ferrite {}, through SQL, statements prepared once", env!("CARGO_PKG_VERSION"))
+        }
+
+        fn load(&mut self, rows: u64) -> Vec<u64> {
+            let mut each = Vec::with_capacity(rows as usize);
+            for i in 0..rows {
+                let t0 = Instant::now();
+                self.put
+                    .run(
+                        &mut self.db,
+                        &[
+                            Value::Int(i as i64),
+                            Value::Int(i as i64),
+                            Value::Real(i as f64 * 1.5),
+                            Value::Text(format!("row {i}")),
+                        ],
+                    )
+                    .expect("insert");
+                each.push(t0.elapsed().as_nanos() as u64);
+            }
+            self.rows = rows;
+            each
+        }
+
+        fn reads(&mut self, ops: u64, rng: &mut Rng) -> Vec<u64> {
+            let mut each = Vec::with_capacity(ops as usize);
+            let rows = self.rows;
+            for _ in 0..ops {
+                let key = rng.below(rows) as i64;
+                let t0 = Instant::now();
+                let got = self
+                    .get
+                    .value(&self.db, &[Value::Int(key)])
+                    .expect("select")
+                    .and_then(|v| v.as_int())
+                    .expect("a row");
+                each.push(t0.elapsed().as_nanos() as u64);
+                debug_assert_eq!(got, key);
+            }
+            each
+        }
+
+        fn mixed(&mut self, ops: u64, writes: u64, rng: &mut Rng) -> Vec<u64> {
+            let mut each = Vec::with_capacity(ops as usize);
+            let rows = self.rows;
+            for _ in 0..ops {
+                let key = rng.below(rows) as i64;
+                let write = rng.below(1000) < writes;
+                let t0 = Instant::now();
+                if write {
+                    self.set
+                        .run(&mut self.db, &[Value::Int(key), Value::Int(key + 1)])
+                        .expect("update");
+                } else {
+                    let _ = self.get.value(&self.db, &[Value::Int(key)]).expect("select");
+                }
+                each.push(t0.elapsed().as_nanos() as u64);
+            }
+            each
         }
     }
 
@@ -307,6 +398,75 @@ mod engine {
             each
         }
     }
+}
+
+// ── The phase 2 gate ───────────────────────────────────────────────────
+
+/// What SQL costs over calling the engine directly.
+///
+/// Measuring the two in separate tables lets the machine drift between
+/// them, and the answer wandered from 3% to 17% run to run. So both run
+/// here in one loop, in alternating batches over the same rows and the
+/// same keys, and each batch is timed whole to keep the clock out of the
+/// per-lookup cost.
+fn phase2_gate(rows: u64, batches: u64, per_batch: u64) -> (f64, f64) {
+    use ferrite::{Db, Kind, Value};
+    let mut db = Db::new();
+    let kv = db
+        .create_table("kv", &[("a", Kind::Int), ("b", Kind::Real), ("c", Kind::Text)])
+        .unwrap();
+    for i in 0..rows {
+        db.table_mut(kv)
+            .insert(
+                i as i64,
+                vec![Value::Int(i as i64), Value::Real(i as f64 * 1.5), Value::Text(format!("row {i}"))],
+            )
+            .unwrap();
+    }
+    let get = db.prepare("SELECT a FROM kv WHERE id = ?1").unwrap();
+    assert!(get.is_point_lookup());
+
+    let mut plain = Vec::with_capacity(batches as usize);
+    let mut sql = Vec::with_capacity(batches as usize);
+    for b in 0..batches {
+        // Whichever batch runs second finds the B-tree already in cache,
+        // and that was worth 10% on its own. So the two take turns going
+        // first, and the advantage cancels out over the run.
+        let plain_first = b % 2 == 0;
+        let mut run_plain = |plain: &mut Vec<u64>| {
+            let mut keys = Rng::new(100 + b);
+            let t0 = Instant::now();
+            let mut sum = 0i64;
+            for _ in 0..per_batch {
+                let key = keys.below(rows) as i64;
+                sum += db.table(kv).get_at(key, 0).unwrap().as_int().unwrap();
+            }
+            plain.push(t0.elapsed().as_nanos() as u64 / per_batch);
+            sum
+        };
+        let mut run_sql = |sql: &mut Vec<u64>| {
+            let mut keys = Rng::new(100 + b);
+            let t0 = Instant::now();
+            let mut sum = 0i64;
+            for _ in 0..per_batch {
+                let key = keys.below(rows) as i64;
+                sum += get.value(&db, &[Value::Int(key)]).unwrap().unwrap().as_int().unwrap();
+            }
+            sql.push(t0.elapsed().as_nanos() as u64 / per_batch);
+            sum
+        };
+        let (a, b2) = if plain_first {
+            let a = run_plain(&mut plain);
+            (a, run_sql(&mut sql))
+        } else {
+            let b2 = run_sql(&mut sql);
+            (run_plain(&mut plain), b2)
+        };
+        assert_eq!(a, b2, "the two paths gave different answers");
+    }
+    plain.sort_unstable();
+    sql.sort_unstable();
+    (plain[plain.len() / 2] as f64, sql[sql.len() / 2] as f64)
 }
 
 // ── The fsync floor ────────────────────────────────────────────────────
@@ -515,7 +675,41 @@ fn main() {
         )).collect();
         middling.push(median_run(per_workload).0);
     }
+    let plain_reads = middling[1].per_sec();
     table(&title, &mut middling);
+    // The same engine through SQL. The phase 2 gate lives in the gap
+    // between this table and the one above.
+    let mut collected: Vec<Vec<Run>> = Vec::new();
+    let mut title = String::new();
+    for go in 0..goes {
+        let mut db = engine::FerriteSql::open();
+        if go == 0 { title = db.name(); }
+        let mut rng = Rng::new(0x5EED_1234 + go as u64);
+        collected.push(vec![
+            measure(&mut db, "bulk insert", |e| e.load(ROWS)),
+            measure(&mut db, "all reads", |e| e.reads(READ_OPS, &mut Rng::new(1 + go as u64))),
+            measure(&mut db, "95/5 read-update", |e| e.mixed(MIXED_OPS, 50, &mut rng)),
+            measure(&mut db, "50/50 read-update", |e| e.mixed(MIXED_OPS, 500, &mut rng)),
+        ]);
+    }
+    let mut sql_runs = Vec::new();
+    for i in 0..4 {
+        let per_workload: Vec<Run> = collected.iter_mut().map(|g| std::mem::replace(
+            &mut g[i],
+            Run { what: "", ops: 0, wall_ns: 1, cpu_ns: 0, each: Vec::new() },
+        )).collect();
+        sql_runs.push(median_run(per_workload).0);
+    }
+    let sql_reads = sql_runs[1].per_sec();
+    table(&title, &mut sql_runs);
+
+    let _ = (plain_reads, sql_reads);
+    let (plain_ns, sql_ns) = phase2_gate(ROWS, 200, 2000);
+    let gap = (sql_ns - plain_ns) / plain_ns * 100.0;
+    println!(
+        "\nPhase 2 gate: a prepared lookup costs {gap:.1}% more than the plain Rust call.\n  {sql_ns:.0} ns against {plain_ns:.0} ns a lookup, side by side. The gate is 10%."
+    );
+
     println!("\nDurability is phase 3. These rows promise nothing about a power cut.");
 }
 
