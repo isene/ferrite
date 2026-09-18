@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>ferrite against SQLite</title>
   <meta name="description" content="ferrite is an embedded SQL database in Rust that keeps its tables in memory. Measured against SQLite on the same disk in the same mode, with what each one has and lacks.">
-  <link rel="icon" href="../img/ferrite.svg" type="image/svg+xml">
+  <link rel="icon" href="ferrite.svg" type="image/svg+xml">
   <style>
     :root {
       --rust: #f74c00;
@@ -44,7 +44,7 @@
     }
     .container { max-width: 900px; margin: 0 auto; padding: 0 1rem; }
     .hero { padding: 4rem 0 2rem; text-align: center; }
-    .hero img {
+    .hero .logo {
       width: 128px; height: 128px; display: block; margin: 0 auto 1rem;
       filter: drop-shadow(0 0 30px rgba(247, 76, 0, 0.45));
     }
@@ -90,7 +90,7 @@
 
   <header class="hero">
     <div class="container">
-      <img src="../img/ferrite.svg" alt="ferrite logo">
+      <img class="logo" src="ferrite.svg" alt="ferrite logo">
       <h1>ferrite</h1>
       <p class="tagline">
         An embedded SQL database in Rust that keeps its tables in memory.
@@ -99,7 +99,6 @@
       <div class="badges">
         <img src="https://img.shields.io/badge/language-Rust-f74c00" alt="Rust">
         <img src="https://img.shields.io/badge/license-Unlicense-green" alt="Unlicense">
-        <img src="https://badgen.net/github/release/isene/ferrite" alt="release">
       </div>
     </div>
   </header>
