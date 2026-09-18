@@ -151,16 +151,53 @@ fn agree(a: &[Vec<Value>], b: &[Vec<Value>]) -> bool {
 
 // ── The test ───────────────────────────────────────────────────────────
 
+/// Where ferrite keeps its rows for a run.
+enum Where {
+    /// In memory, forgetting everything at the end.
+    Memory,
+    /// In a directory, closed and opened again every so often, so that
+    /// the log has to give back exactly what was put in.
+    OnDisk { dir: std::path::PathBuf, reopen_every: usize },
+}
+
 fn run_one_seed(seed: u64, rounds: usize) {
+    run_it(seed, rounds, Where::Memory)
+}
+
+fn run_it(seed: u64, rounds: usize, place: Where) {
     let conn = Connection::open_in_memory().expect("sqlite");
     conn.execute_batch(SCHEMA).expect("sqlite schema");
-    let mut db = Db::new();
+    let mut db = match &place {
+        Where::Memory => Db::new(),
+        Where::OnDisk { dir, .. } => {
+            let _ = std::fs::remove_dir_all(dir);
+            Db::open(dir).expect("open")
+        }
+    };
     db.execute(SCHEMA, &[]).expect("ferrite schema");
 
     let mut rng = Rng::new(seed);
     let mut queries = 0usize;
+    let mut reopens = 0usize;
 
     for round in 0..rounds {
+        // Close it and open it again. Everything committed has to come
+        // back, or the log has lost something.
+        if let Where::OnDisk { dir, reopen_every } = &place {
+            if round > 0 && round % reopen_every == 0 {
+                db.flush().expect("flush");
+                drop(db);
+                db = Db::open(dir).expect("reopen");
+                reopens += 1;
+                let mine = sorted(db.query("SELECT * FROM t", &[]).unwrap().rows().to_vec());
+                let theirs = sorted(sqlite_rows(&conn, "SELECT * FROM t").unwrap());
+                assert!(
+                    agree(&theirs, &mine),
+                    "seed {seed}, round {round}: reopening gave a different database\n  \
+                     sqlite:  {theirs:?}\n  ferrite: {mine:?}"
+                );
+            }
+        }
         let sql = a_change(&mut rng);
         let theirs = conn.execute(&sql, []);
         let mine = db.execute(&sql, &[]);
@@ -204,12 +241,31 @@ fn run_one_seed(seed: u64, rounds: usize) {
         }
     }
     assert!(queries > rounds / 2, "hardly any queries were compared");
+    if let Where::OnDisk { dir, .. } = &place {
+        assert!(reopens > 0, "it never reopened");
+        drop(db);
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 #[test]
 fn random_sql_gives_the_same_answers_as_sqlite() {
     for seed in [1, 2, 3, 7, 11, 12345, 99991, 0xBEEF, 0xD00D, 0xFEED] {
         run_one_seed(seed, 2000);
+    }
+}
+
+/// The same random SQL, but with the rows on a disk and the database
+/// closed and opened again as it goes. In memory a bug in the log can
+/// never show; here it has to.
+#[test]
+fn the_same_holds_with_the_rows_on_a_disk() {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    for (n, seed) in [3u64, 19, 0xBEEF, 0xC0FFEE].into_iter().enumerate() {
+        let dir = std::path::PathBuf::from(&home)
+            .join(".cache")
+            .join(format!("ferrite-diff-{}-{n}", std::process::id()));
+        run_it(seed, 1200, Where::OnDisk { dir, reopen_every: 50 });
     }
 }
 

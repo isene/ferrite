@@ -416,8 +416,11 @@ impl Store {
         let mut bytes = Vec::new();
         log.read_to_end(&mut bytes).map_err(io)?;
         let (mut found, good) = decode_all(&bytes);
+        // Only the log counts towards the next snapshot. The records in
+        // the snapshot are already compacted, so counting them would
+        // make the log look fuller than it is.
+        let counted = found.iter().map(|c| c.len() as u64).sum();
         commits.append(&mut found);
-        let counted = commits.iter().map(|c| c.len() as u64).sum();
         if good as u64 != bytes.len() as u64 {
             // Cut the half-written tail a crash left behind.
             log.set_len(good as u64).map_err(io)?;
