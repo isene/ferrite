@@ -33,7 +33,7 @@ pub mod sql;
 pub use log::Durability;
 pub use plan::{Outcome, Statement};
 
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeMap, HashMap};
 use std::path::Path;
 
 use log::{Change, Store};
@@ -224,10 +224,11 @@ pub type Row = Vec<Value>;
 
 /// One table, with its rows under an integer primary key.
 ///
-/// The rows live in a `BTreeMap`, which keeps them in key order. That
-/// costs a little against a hash map on a single lookup and pays for
-/// itself the moment anything asks for a range, an ORDER BY or the next
-/// key. Phase 5 is where that trade gets measured rather than assumed.
+/// The rows sit in one vector, the slab, and the key tree maps a key to
+/// a slot in it. An index does the same, so a row found through an index
+/// is one array lookup away rather than a second walk down the tree. The
+/// tree keeps the keys in order, which is what a range, an ORDER BY and
+/// the next key all lean on.
 #[derive(Debug, Clone)]
 pub struct Table {
     name: String,
@@ -238,7 +239,12 @@ pub struct Table {
     /// the row; it is what the row is filed under.
     key: String,
     columns: Vec<Column>,
-    rows: BTreeMap<i64, Row>,
+    /// Key to slot.
+    rows: BTreeMap<i64, u32>,
+    /// The rows themselves. A slot that has been freed holds None until
+    /// an insert takes it again.
+    slab: Vec<Option<Row>>,
+    free: Vec<u32>,
     /// Which indexes have to be kept up as rows change. Empty is the
     /// usual case, and one test of that keeps the cost off the hot path.
     watchers: Vec<usize>,
@@ -258,12 +264,68 @@ impl Table {
 
     /// The row under that key.
     #[inline]
-    pub fn get(&self, key: i64) -> Option<&Row> { self.rows.get(&key) }
+    pub fn get(&self, key: i64) -> Option<&Row> {
+        let slot = *self.rows.get(&key)?;
+        self.slab[slot as usize].as_ref()
+    }
 
     /// One value out of the row under that key.
     #[inline]
     pub fn get_at(&self, key: i64, column: usize) -> Option<&Value> {
-        self.rows.get(&key)?.get(column)
+        self.get(key)?.get(column)
+    }
+
+    /// The row in a given slot. An index hands slots out, so a row it
+    /// found costs an array lookup and nothing more.
+    #[inline]
+    pub fn at_slot(&self, slot: u32) -> Option<&Row> {
+        self.slab.get(slot as usize)?.as_ref()
+    }
+
+    /// Which slot a key's row is in.
+    #[inline]
+    pub(crate) fn slot_of(&self, key: i64) -> Option<u32> { self.rows.get(&key).copied() }
+
+    fn alloc(&mut self, row: Row) -> u32 {
+        match self.free.pop() {
+            Some(slot) => {
+                self.slab[slot as usize] = Some(row);
+                slot
+            }
+            None => {
+                self.slab.push(Some(row));
+                (self.slab.len() - 1) as u32
+            }
+        }
+    }
+
+    /// Put a row under a key with no checking at all: for undoing and
+    /// for replaying the log, where the row has been checked before.
+    pub(crate) fn place(&mut self, key: i64, row: Row) -> Option<Row> {
+        if let Some(&slot) = self.rows.get(&key) {
+            return self.slab[slot as usize].replace(row);
+        }
+        let slot = self.alloc(row);
+        self.rows.insert(key, slot);
+        None
+    }
+
+    /// Take a row out and hand it back.
+    pub(crate) fn take(&mut self, key: i64) -> Option<Row> {
+        let slot = self.rows.remove(&key)?;
+        self.free.push(slot);
+        self.slab[slot as usize].take()
+    }
+
+    pub(crate) fn get_mut(&mut self, key: i64) -> Option<&mut Row> {
+        let slot = *self.rows.get(&key)?;
+        self.slab[slot as usize].as_mut()
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.rows.clear();
+        self.slab.clear();
+        self.free.clear();
     }
 
     /// Put a new row in. It is an error if the key is taken, so nothing
@@ -273,14 +335,15 @@ impl Table {
         if self.rows.contains_key(&key) {
             return Err(Error::KeyExists(key));
         }
-        self.rows.insert(key, row);
+        let slot = self.alloc(row);
+        self.rows.insert(key, slot);
         Ok(())
     }
 
     /// Put a row in, over whatever was there. Gives back the old row.
     pub fn put(&mut self, key: i64, row: Row) -> Result<Option<Row>> {
         self.check(&row)?;
-        Ok(self.rows.insert(key, row))
+        Ok(self.place(key, row))
     }
 
     /// Change one value in an existing row.
@@ -296,29 +359,35 @@ impl Table {
         if value == Value::Null && !col.null_ok {
             return Err(Error::NotNull(col.name.clone()));
         }
-        let row = self.rows.get_mut(&key).ok_or(Error::NoKey(key))?;
+        let row = self.get_mut(key).ok_or(Error::NoKey(key))?;
         row[column] = value;
         Ok(())
     }
 
     /// Take a row out. True when there was one.
-    pub fn delete(&mut self, key: i64) -> bool { self.rows.remove(&key).is_some() }
+    pub fn delete(&mut self, key: i64) -> bool { self.take(key).is_some() }
 
     /// Every row in key order.
     pub fn iter(&self) -> impl Iterator<Item = (i64, &Row)> {
-        self.rows.iter().map(|(k, r)| (*k, r))
+        self.rows.iter().map(|(k, s)| (*k, self.slab[*s as usize].as_ref().expect("a slot the key tree points at is empty")))
+    }
+
+    /// Every row in key order, with its slot.
+    fn iter_slots(&self) -> impl Iterator<Item = (i64, u32, &Row)> {
+        self.rows.iter().map(|(k, s)| (*k, *s, self.slab[*s as usize].as_ref().expect("a slot the key tree points at is empty")))
     }
 
     /// The rows whose keys fall in a range, in order. A range that ends
     /// before it starts holds nothing, rather than being a mistake:
     /// `WHERE id > 6 AND id < 3` is a fair question with no answer.
     pub fn range(&self, from: i64, to: i64) -> impl Iterator<Item = (i64, &Row)> {
-        self.rows.range(from..to.max(from)).map(|(k, r)| (*k, r))
+        self.rows.range(from..to.max(from)).map(|(k, s)| (*k, self.slab[*s as usize].as_ref().expect("a slot the key tree points at is empty")))
     }
 
     /// Put a row in that has already been looked over.
     pub(crate) fn insert_known_good(&mut self, key: i64, row: Row) {
-        self.rows.insert(key, row);
+        let slot = self.alloc(row);
+        self.rows.insert(key, slot);
     }
 
     /// Would this row go in under this key?
@@ -372,14 +441,19 @@ impl Table {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct IndexId(usize);
 
-/// One column of one table, with the keys of every row that holds each
-/// value. Several rows can share a value, so each entry holds a set.
+/// One column of one table, with every row that holds each value.
+///
+/// Each entry keeps the row's own value beside its key, not only the
+/// value the entry is filed under. Those two can differ: 5 and 5.0 are
+/// equal in SQL, so they share an entry, and only the row knows which of
+/// them it holds. Keeping it here is what lets a query asking for this
+/// column be answered without fetching the row at all.
 #[derive(Debug, Clone)]
 pub struct Index {
     name: String,
     table: TableId,
     column: usize,
-    entries: BTreeMap<SortKey, BTreeSet<i64>>,
+    entries: BTreeMap<SortKey, BTreeMap<i64, (u32, Value)>>,
     dropped: bool,
 }
 
@@ -388,25 +462,31 @@ impl Index {
     pub fn table(&self) -> TableId { self.table }
     pub fn column(&self) -> usize { self.column }
 
-    /// The keys of the rows whose value in this column is `value`.
-    pub fn keys_for(&self, value: &Value) -> Option<&BTreeSet<i64>> {
+    /// The rows whose value in this column equals `value`, in key order,
+    /// each with its slot and the value it actually holds.
+    pub fn rows_for(&self, value: &Value) -> Option<&BTreeMap<i64, (u32, Value)>> {
         self.entries.get(&SortKey(value.clone()))
     }
 
+    /// Just the keys of those rows.
+    pub fn keys_for(&self, value: &Value) -> Option<impl Iterator<Item = &i64>> {
+        self.rows_for(value).map(|m| m.keys())
+    }
+
     /// Every value in order, with the rows holding it.
-    pub fn iter(&self) -> impl Iterator<Item = (&Value, &BTreeSet<i64>)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&Value, &BTreeMap<i64, (u32, Value)>)> {
         self.entries.iter().map(|(k, v)| (&k.0, v))
     }
 
-    fn add(&mut self, value: &Value, key: i64) {
-        self.entries.entry(SortKey(value.clone())).or_default().insert(key);
+    fn add(&mut self, value: &Value, key: i64, slot: u32) {
+        self.entries.entry(SortKey(value.clone())).or_default().insert(key, (slot, value.clone()));
     }
 
     fn remove(&mut self, value: &Value, key: i64) {
         let k = SortKey(value.clone());
-        if let Some(set) = self.entries.get_mut(&k) {
-            set.remove(&key);
-            if set.is_empty() { self.entries.remove(&k); }
+        if let Some(rows) = self.entries.get_mut(&k) {
+            rows.remove(&key);
+            if rows.is_empty() { self.entries.remove(&k); }
         }
     }
 }
@@ -476,6 +556,8 @@ impl Db {
             key: key.to_string(),
             columns,
             rows: BTreeMap::new(),
+            slab: Vec::new(),
+            free: Vec::new(),
             watchers: Vec::new(),
         });
         self.by_name.insert(name.to_string(), id.0);
@@ -555,11 +637,21 @@ impl Db {
         self.in_txn = false;
         self.journal.clear();
         self.journal_count = 0;
+        // Every step back has to reach the indexes too, or a rolled back
+        // insert would stay findable through one.
         while let Some(step) = self.undo.pop() {
             match step {
-                Undo::Added(id, key) => { self.tables[id.0].rows.remove(&key); }
-                Undo::Was(id, key, Some(row)) => { self.tables[id.0].rows.insert(key, row); }
-                Undo::Was(id, key, None) => { self.tables[id.0].rows.remove(&key); }
+                Undo::Added(id, key) | Undo::Was(id, key, None) => {
+                    if let Some(row) = self.tables[id.0].take(key) {
+                        self.index_take(id, key, &row);
+                    }
+                }
+                Undo::Was(id, key, Some(row)) => {
+                    if let Some(now) = self.tables[id.0].place(key, row.clone()) {
+                        self.index_take(id, key, &now);
+                    }
+                    self.index_add(id, key, &row);
+                }
             }
         }
     }
@@ -576,7 +668,7 @@ impl Db {
     #[inline]
     pub(crate) fn note_change(&mut self, table: TableId, key: i64) {
         if self.in_txn {
-            let was = self.tables[table.0].rows.get(&key).cloned();
+            let was = self.tables[table.0].get(key).cloned();
             self.undo.push(Undo::Was(table, key, was));
         }
     }
@@ -584,10 +676,22 @@ impl Db {
     /// Throw a table away, with everything in it.
     pub fn drop_table(&mut self, name: &str) -> Result<()> {
         let i = *self.by_name.get(name).ok_or_else(|| Error::NoTable(name.to_string()))?;
-        self.tables[i].rows.clear();
-        self.tables[i].dropped = true;
-        self.by_name.remove(name);
+        self.forget_table(i);
         self.record(Change::DropTable { name: name.to_string() })
+    }
+
+    /// Empty a table and mark it gone, and take its indexes with it. The
+    /// log records only the table, and replay does the same, so the two
+    /// sides agree without an extra record.
+    fn forget_table(&mut self, i: usize) {
+        self.tables[i].clear();
+        self.tables[i].dropped = true;
+        self.by_name.remove(&self.tables[i].name.clone());
+        for slot in std::mem::take(&mut self.tables[i].watchers) {
+            self.indexes[slot].entries.clear();
+            self.indexes[slot].dropped = true;
+            self.index_names.remove(&self.indexes[slot].name.clone());
+        }
     }
 
     // ── Indexes ────────────────────────────────────────────────────────
@@ -645,23 +749,23 @@ impl Db {
     fn fill_index(&mut self, slot: usize) {
         let table = self.indexes[slot].table;
         let column = self.indexes[slot].column;
-        let pairs: Vec<(i64, Value)> = self.tables[table.0]
-            .rows
-            .iter()
-            .filter_map(|(k, row)| row.get(column).map(|v| (*k, v.clone())))
+        let triples: Vec<(i64, u32, Value)> = self.tables[table.0]
+            .iter_slots()
+            .filter_map(|(k, s, row)| row.get(column).map(|v| (k, s, v.clone())))
             .collect();
-        for (key, value) in pairs {
-            self.indexes[slot].add(&value, key);
+        for (key, at, value) in triples {
+            self.indexes[slot].add(&value, key, at);
         }
     }
 
     /// Put a row into every index watching its table.
     fn index_add(&mut self, table: TableId, key: i64, row: &Row) {
         if self.tables[table.0].watchers.is_empty() { return; }
+        let Some(at) = self.tables[table.0].slot_of(key) else { return };
         for slot in self.tables[table.0].watchers.clone() {
             if let Some(v) = row.get(self.indexes[slot].column) {
                 let v = v.clone();
-                self.indexes[slot].add(&v, key);
+                self.indexes[slot].add(&v, key, at);
             }
         }
     }
@@ -736,7 +840,7 @@ impl Db {
         }
         self.note_insert(table, key);
         if self.watched(table) {
-            let row = self.tables[table.0].rows[&key].clone();
+            let row = self.tables[table.0].get(key).cloned().expect("the row that was just put in");
             self.index_add(table, key, &row);
         }
         self.close_if_alone()
@@ -758,7 +862,7 @@ impl Db {
         }
         let old = self.tables[table.0].put(key, row)?;
         if watched {
-            let now = self.tables[table.0].rows[&key].clone();
+            let now = self.tables[table.0].get(key).cloned().expect("the row that was just put in");
             self.index_add(table, key, &now);
         }
         self.close_if_alone()?;
@@ -779,10 +883,11 @@ impl Db {
         if watched {
             let slots = self.tables[table.0].watchers.clone();
             let now = self.tables[table.0].get_at(key, column).cloned();
+            let at = self.tables[table.0].slot_of(key).expect("the row that was just changed");
             for slot in slots {
                 if self.indexes[slot].column != column { continue; }
                 if let Some(v) = &was { self.indexes[slot].remove(v, key); }
-                if let Some(v) = &now { self.indexes[slot].add(v, key); }
+                if let Some(v) = &now { self.indexes[slot].add(v, key, at); }
             }
         }
         self.close_if_alone()
@@ -871,7 +976,7 @@ impl Db {
     }
 
     fn snapshot_if_grown(&mut self) -> Result<()> {
-        let live: u64 = self.tables.iter().map(|t| t.rows.len() as u64).sum();
+        let live: u64 = self.tables.iter().map(|t| t.len() as u64).sum();
         if self.store.as_ref().is_some_and(|s| s.wants_snapshot(live)) {
             let all = self.everything();
             if let Some(s) = &mut self.store { s.snapshot(&all)?; }
@@ -894,8 +999,8 @@ impl Db {
                 out.push(Change::DropTable { name: t.name.clone() });
                 continue;
             }
-            for (key, row) in &t.rows {
-                out.push(Change::Put { table: i as u32, key: *key, row: row.clone() });
+            for (key, row) in t.iter() {
+                out.push(Change::Put { table: i as u32, key, row: row.clone() });
             }
         }
         for index in &self.indexes {
@@ -918,27 +1023,26 @@ impl Db {
                     self.create_table_full(&name, &key, columns)?;
                 }
                 Change::DropTable { name } => {
-                    if let Some(i) = self.by_name.remove(&name) {
-                        self.tables[i].rows.clear();
-                        self.tables[i].dropped = true;
+                    if let Some(&i) = self.by_name.get(&name) {
+                        self.forget_table(i);
                     }
                 }
                 Change::Put { table, key, row } => {
                     let t = self.tables.get_mut(table as usize)
                         .ok_or_else(|| Error::Disk(format!("the log names table {table}, which is not there")))?;
-                    t.rows.insert(key, row);
+                    t.place(key, row);
                 }
                 Change::Set { table, key, col, value } => {
                     let t = self.tables.get_mut(table as usize)
                         .ok_or_else(|| Error::Disk(format!("the log names table {table}, which is not there")))?;
-                    if let Some(row) = t.rows.get_mut(&key) {
-                        if let Some(slot) = row.get_mut(col as usize) { *slot = value; }
+                    if let Some(row) = t.get_mut(key) {
+                        if let Some(cell) = row.get_mut(col as usize) { *cell = value; }
                     }
                 }
                 Change::Delete { table, key } => {
                     let t = self.tables.get_mut(table as usize)
                         .ok_or_else(|| Error::Disk(format!("the log names table {table}, which is not there")))?;
-                    t.rows.remove(&key);
+                    t.take(key);
                 }
                 Change::NewIndex { name, table, column } => {
                     let t = self.tables.get(table as usize)

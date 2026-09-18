@@ -574,8 +574,22 @@ fn index_gain(rows: u64) -> Vec<(&'static str, &'static str, f64, f64)> {
         let t0 = Instant::now();
         for _ in 0..ops {
             let v = rng.below(spread) as i64;
+            // Read the value out, the way ferrite's side has to. Leaving
+            // it in the row would let SQLite skip the copy that ferrite
+            // makes, and the two would not be doing the same work.
             let mut got = ask.query(rusqlite::params![v]).unwrap();
-            while got.next().unwrap().is_some() {}
+            let mut rows: Vec<Vec<ferrite::Value>> = Vec::new();
+            while let Some(row) = got.next().unwrap() {
+                let v: ferrite::Value = match row.get_ref(0).unwrap() {
+                    rusqlite::types::ValueRef::Integer(i) => ferrite::Value::Int(i),
+                    rusqlite::types::ValueRef::Text(s) => {
+                        ferrite::Value::Text(String::from_utf8_lossy(s).into_owned())
+                    }
+                    _ => ferrite::Value::Null,
+                };
+                rows.push(vec![v]);
+            }
+            std::hint::black_box(rows);
         }
         t0.elapsed().as_nanos() as f64 / ops as f64 / 1000.0
     };
@@ -857,8 +871,19 @@ fn main() {
         let _ = std::fs::remove_dir_all(&path);
     }
 
-    // What an index is for.
-    let gain = index_gain(ROWS);
+    // What an index is for. Several goes, the middling one of each cell,
+    // because one go of this wandered by 15% from run to run.
+    let mut all: Vec<Vec<(&str, &str, f64, f64)>> = (0..goes).map(|_| index_gain(ROWS)).collect();
+    let cells = all[0].len();
+    let mut gain = Vec::with_capacity(cells);
+    for i in 0..cells {
+        let mut walked: Vec<f64> = all.iter().map(|g| g[i].2).collect();
+        let mut looked: Vec<f64> = all.iter().map(|g| g[i].3).collect();
+        walked.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        looked.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        gain.push((all[0][i].0, all[0][i].1, walked[walked.len() / 2], looked[looked.len() / 2]));
+    }
+    all.clear();
     println!("\nA lookup on a column that is not the key, {ROWS} rows, one value in a hundred");
     println!(
         "  {:<10}{:<16}{:>12}{:>12}{:>9}",

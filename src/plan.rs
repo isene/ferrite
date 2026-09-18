@@ -801,7 +801,11 @@ fn keys_from_index(
     if join.is_some() || !filter.tests.is_empty() || picks.is_empty() {
         return Ok(None);
     }
-    if !picks.iter().all(|p| *p == Pick::Key(0)) {
+    let Find::Index { index, value } = &filter.find else { return Ok(None) };
+    let on = db.index(*index).column();
+    // The key, and the column the index is on. Both are in the index, so
+    // neither needs the row.
+    if !picks.iter().all(|p| *p == Pick::Key(0) || *p == Pick::Col(0, on)) {
         return Ok(None);
     }
     // The keys come out of the index in order, so sorting by the key is
@@ -811,17 +815,21 @@ fn keys_from_index(
         [one] if one.pick == Pick::Key(0) => one.desc,
         _ => return Ok(None),
     };
-    let Find::Index { index, value } = &filter.find else { return Ok(None) };
     let value = value_of(value, params)?;
     let mut out = Vec::new();
     if *value == Value::Null { return Ok(Some(out)); }
-    let Some(keys) = db.index(*index).keys_for(value) else { return Ok(Some(out)) };
+    let Some(rows) = db.index(*index).rows_for(value) else { return Ok(Some(out)) };
     let cap = limit.unwrap_or(usize::MAX);
-    let mut push = |k: i64| out.push(vec![Value::Int(k); picks.len()]);
+    let make = |key: &i64, held: &Value| -> Row {
+        picks
+            .iter()
+            .map(|p| if *p == Pick::Key(0) { Value::Int(*key) } else { held.clone() })
+            .collect()
+    };
     if desc {
-        keys.iter().rev().take(cap).for_each(|k| push(*k));
+        rows.iter().rev().take(cap).for_each(|(k, (_, v))| out.push(make(k, v)));
     } else {
-        keys.iter().take(cap).for_each(|k| push(*k));
+        rows.iter().take(cap).for_each(|(k, (_, v))| out.push(make(k, v)));
     }
     Ok(Some(out))
 }
@@ -845,7 +853,7 @@ fn counted_without_rows(
             if *v == Value::Null {
                 0
             } else {
-                db.index(*index).keys_for(v).map_or(0, |k| k.len()) as i64
+                db.index(*index).rows_for(v).map_or(0, |r| r.len()) as i64
             }
         }
         // A range of keys has to be walked; a B-tree cannot say how many
@@ -965,9 +973,9 @@ fn visit(
                 Ok(true)
             }
             JoinBy::Index(index) => {
-                let Some(keys) = db.index(*index).keys_for(&value) else { return Ok(true) };
-                for k in keys {
-                    let Some(r) = right.get(*k) else { continue };
+                let Some(rows) = db.index(*index).rows_for(&value) else { return Ok(true) };
+                for (k, (slot, _)) in rows {
+                    let Some(r) = right.at_slot(*slot) else { continue };
                     let both = [(key, row), (*k, r)];
                     if passes(&filter.after_join, &both, params)? && !each(&both)? {
                         return Ok(false);
@@ -1001,9 +1009,9 @@ fn visit(
         Find::Index { index, value } => {
             let value = value_of(value, params)?;
             if *value == Value::Null { return Ok(()); }
-            if let Some(keys) = db.index(*index).keys_for(value) {
-                for key in keys {
-                    let Some(row) = t.get(*key) else { continue };
+            if let Some(rows) = db.index(*index).rows_for(value) {
+                for (key, (slot, _)) in rows {
+                    let Some(row) = t.at_slot(*slot) else { continue };
                     if !go(*key, row)? { break; }
                 }
             }
@@ -1396,6 +1404,50 @@ mod tests {
         let some = db.query("SELECT id FROM kv WHERE a = 50 AND id > 3", &[]).unwrap();
         let ids: Vec<i64> = some.rows().iter().map(|r| r[0].as_int().unwrap()).collect();
         assert_eq!(ids, vec![5, 7]);
+    }
+
+    #[test]
+    fn the_index_hands_back_the_value_the_row_holds() {
+        // 5 and 5.0 are equal in SQL, so they share one index entry.
+        // Asking for the column has to give back what each row holds.
+        let mut db = Db::new();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, r REAL)", &[]).unwrap();
+        db.execute("INSERT INTO t (id, a, r) VALUES (1, 5, 5.0)", &[]).unwrap();
+        db.execute("INSERT INTO t (id, a, r) VALUES (2, 5, 5.0)", &[]).unwrap();
+        db.execute("CREATE INDEX t_r ON t (r)", &[]).unwrap();
+        // Looking for the whole number finds the real, as SQL says.
+        let out = db.query("SELECT id, r FROM t WHERE r = 5", &[]).unwrap();
+        assert_eq!(out.rows().len(), 2);
+        for row in out.rows() {
+            assert_eq!(row[1], Value::Real(5.0), "the row holds a real, not a whole number");
+        }
+    }
+
+    #[test]
+    fn a_rollback_puts_the_index_back_too() {
+        let mut db = kv();
+        db.execute("CREATE INDEX kv_a ON kv (a)", &[]).unwrap();
+        let through_index = |db: &Db, v: i64| -> Vec<i64> {
+            db.query(&format!("SELECT id FROM kv WHERE a = {v}"), &[])
+                .unwrap()
+                .rows()
+                .iter()
+                .map(|r| r[0].as_int().unwrap())
+                .collect()
+        };
+        db.execute("BEGIN", &[]).unwrap();
+        db.execute("INSERT INTO kv (id, a) VALUES (99, 30)", &[]).unwrap();
+        db.execute("UPDATE kv SET a = 30 WHERE id = 8", &[]).unwrap();
+        db.execute("DELETE FROM kv WHERE id = 3", &[]).unwrap();
+        assert_eq!(through_index(&db, 30), vec![8, 99]);
+        assert_eq!(through_index(&db, 80), vec![]);
+        db.execute("ROLLBACK", &[]).unwrap();
+        assert_eq!(through_index(&db, 30), vec![3], "row 3 is back and 8 and 99 are gone");
+        assert_eq!(through_index(&db, 80), vec![8], "row 8 has its old value again");
+        // And the index agrees with a walk, which is the real test.
+        db.execute("DROP INDEX kv_a", &[]).unwrap();
+        assert_eq!(through_index(&db, 30), vec![3]);
+        assert_eq!(through_index(&db, 80), vec![8]);
     }
 
     #[test]

@@ -280,6 +280,9 @@ Prepare it again to pick the index up.
 
 ## Phase 5: speed, one measured step at a time
 
+Three steps, each one asked for by a number. At the end of them ferrite
+matches or beats SQLite on every row of the bench.
+
 ### The checksum was most of a commit
 
 A bulk load of 100,000 rows spent 23 of its 26 milliseconds working out
@@ -287,50 +290,68 @@ a checksum. The profiler named it, so it got the instruction.
 
 CRC32C is the same idea as the CRC32 in a zip file with one constant
 changed, and it has been a single x86-64 instruction since 2008. Over
-5 MB: **23.1 ms by a table in memory, 1.5 ms by the instruction.**
+5 MB: **23.1 ms by a table in memory, 1.5 ms by the instruction.** The
+table version is still there for a processor without it, and is tested
+against it over six hundred lengths and both alignments.
 
-| | before | after |
-|---|---|---|
-| writing a 4.9 MB commit | 26 ms | 5 ms |
-| a bulk load, all of it | 955 ns a row | 711 ns |
-| bulk insert, NORMAL | 1 435 231 /s | 1 864 413 /s |
-| bulk insert, FULL | 1 112 358 /s | 1 720 541 /s |
-
-SQLite does 1 261 124 and 1 184 987. The table version is still there
-and still tested against the instruction, for a processor without it.
-
-### A query that wants only the key never needs the rows
-
-| asking for | before | after | SQLite |
-|---|---|---|---|
-| the key only | 256 µs | 48 µs | 68 µs |
-| a number | 363 µs | 363 µs | 67 µs |
-| a string | 500 µs | 500 µs | 434 µs |
+### A query that wants only what the index holds never needs the rows
 
 An index already holds the keys, so `SELECT id FROM t WHERE a = ?` is
-answered without touching a row.
+answered from it alone. It now holds each row's own value too, so
+`SELECT a FROM t WHERE a = ?` is as well.
 
-**SQLite is still five times quicker at fetching the indexed column
-itself**, and that gap is going to stay. Its index holds the value
-beside the key, so `SELECT a FROM t WHERE a = ?` is covered too.
+That second one needed a decision. 5 and 5.0 are equal in SQL, so they
+share one index entry, and the entry itself cannot say which of them a
+given row holds. Reading the column off the entry would sometimes hand
+back the wrong one.
 
-ferrite's index files keys under a value, and two different values can
-share an entry: 5 and 5.0 compare equal, as SQL says they must. So the
-entry cannot say which of them a row holds, and reading the column off
-the index would sometimes hand back the wrong one.
+So each row keeps its own value beside its key, at the cost of one value
+per indexed row. A test puts 5 and 5.0 in the same index and checks that
+each row gets its own back.
 
-Storing each row's own value beside its key would fix it, and cost a
-value per indexed row.
+### Rows in a slab, slots in the index
 
-**Fetching a real column is within 15% of SQLite**, once the string
-copying is taken out: 363 µs against 434 for the same work plus a
-string.
+Fetching a row through an index cost a second walk down the key tree
+for every match, and on a thousand matches that was 6% slower than
+SQLite. Now the rows sit in one vector, the key tree maps a key to a
+slot in it, and so does every index. A row found through an index is an
+array lookup away.
+
+| asking for, through an index | before | after | SQLite |
+|---|---|---|---|
+| the key only | 256 µs | 53 µs | 125 µs |
+| the indexed column | 363 µs | 54 µs | 122 µs |
+| a text column | 549 µs | 316 µs | 570 µs |
+
+The SQLite numbers went up along the way, and that is the comparison
+getting fairer, not SQLite getting slower: its side of the bench now
+copies the value out and builds a row for it, which is what ferrite's
+side has to do. Walking the whole table got quicker too, 3 400 µs down
+to 2 700, because the rows are now next to each other in memory.
+
+Two bugs came out while the slab went in, both in things the random SQL
+never does:
+
+- ROLLBACK put the rows back and left the indexes as they were, so a
+  rolled back insert stayed findable through an index.
+- Dropping a table left its indexes standing.
+
+### Where it stands, same disk, same mode
+
+| workload | SQLite FULL | ferrite FULL | SQLite NORMAL | ferrite NORMAL |
+|---|---|---|---|---|
+| bulk insert | 1 166 367 | 1 567 386 | 1 261 951 | 1 870 768 |
+| all reads | 421 320 | 1 584 627 | 424 433 | 1 922 235 |
+| 95/5 read-update | 47 612 | 82 260 | 290 882 | 1 383 413 |
+| 50/50 read-update | 10 173 | 11 325 | 116 955 | 702 545 |
+
+Point reads in memory: 2 330 720 a second, and a prepared lookup costs
+no more than the direct call.
 
 ### What was left alone
 
-The plan lists an adaptive radix tree and an arena for rows. Neither has
-a measurement asking for it. Point reads are five times SQLite already
-and bulk insert is ahead, so both would be work on a guess.
+The adaptive radix tree in the plan. Point reads are five times SQLite,
+and no measurement is asking for more.
 
 ## A trap this bench fell into
 
