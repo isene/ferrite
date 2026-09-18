@@ -3,7 +3,7 @@
 An embedded SQL database in Rust, built to beat SQLite at small reads and
 writes. Part of the [Fe2O3](https://github.com/isene/fe2o3) suite.
 
-**Status:** phase 3 done. There is nothing to install yet. The plan is
+**Status:** phase 4 done. There is nothing to install yet. The plan is
 in [PLAN.md](PLAN.md) and the numbers are in [BASELINE.md](BASELINE.md).
 
 ## Read this before you store anything you care about
@@ -19,8 +19,9 @@ much, because every commit waits for one fsync.
 Both were killed with SIGKILL 10,000 times mid-write. Neither lost a
 committed row and neither left a file that would not open.
 
-It speaks CREATE TABLE, INSERT, SELECT, UPDATE, DELETE, WHERE, LIMIT,
-COUNT and transactions. With its files on the same disk as SQLite's, it
+It speaks CREATE TABLE, CREATE INDEX, INSERT, SELECT, UPDATE, DELETE,
+WHERE, an inner join, ORDER BY, LIMIT, COUNT, SUM, MIN, MAX and
+transactions. With its files on the same disk as SQLite's, it
 reads about 2 million rows a second against SQLite's 422 thousand, and
 does 738 thousand mixed operations against SQLite's 117 thousand.
 

@@ -139,19 +139,65 @@ pub enum Expr {
     Param(usize),
 }
 
+/// A column, and which table it came from when that has to be said.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Name {
+    pub table: Option<String>,
+    pub column: String,
+}
+
+impl Name {
+    pub fn bare(column: &str) -> Name { Name { table: None, column: column.to_string() } }
+}
+
+impl std::fmt::Display for Name {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.table {
+            Some(t) => write!(f, "{t}.{}", self.column),
+            None => write!(f, "{}", self.column),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cond {
-    pub column: String,
+    pub column: Name,
     pub cmp: Cmp,
     pub value: Expr,
+}
+
+/// The four things a query can work out over a lot of rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Func { Count, Sum, Min, Max }
+
+/// One of them, and what it is over. `COUNT(*)` has nothing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Agg {
+    pub func: Func,
+    pub arg: Option<Name>,
+}
+
+/// A column to sort by, and which way.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Order {
+    pub name: Name,
+    pub desc: bool,
+}
+
+/// A second table, joined on one column being equal to another.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Join {
+    pub table: String,
+    pub left: Name,
+    pub right: Name,
 }
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Project {
     All,
-    Columns(Vec<String>),
-    /// `SELECT COUNT(*)`.
-    Count,
+    Columns(Vec<Name>),
+    /// A select list that is all aggregates, which gives one row back.
+    Aggs(Vec<Agg>),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -167,8 +213,17 @@ pub struct ColDef {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Stmt {
     CreateTable { name: String, columns: Vec<ColDef>, if_missing: bool },
+    CreateIndex { name: String, table: String, column: String, if_missing: bool },
+    DropIndex { name: String, if_there: bool },
     Insert { table: String, columns: Vec<String>, values: Vec<Expr> },
-    Select { table: String, project: Project, filter: Vec<Cond>, limit: Option<usize> },
+    Select {
+        table: String,
+        join: Option<Join>,
+        project: Project,
+        filter: Vec<Cond>,
+        order: Vec<Order>,
+        limit: Option<usize>,
+    },
     Update { table: String, sets: Vec<(String, Expr)>, filter: Vec<Cond> },
     Delete { table: String, filter: Vec<Cond> },
     Begin,
@@ -235,8 +290,19 @@ impl Parser {
         }
     }
 
+    /// A column name, which may say its table first.
+    fn qualified(&mut self) -> Result<Name> {
+        let first = self.name()?;
+        if self.eat_sym('.') {
+            let column = self.name()?;
+            return Ok(Name { table: Some(first), column });
+        }
+        Ok(Name { table: None, column: first })
+    }
+
     fn statement(&mut self) -> Result<Stmt> {
         if self.eat_word("create") { return self.create(); }
+        if self.eat_word("drop") { return self.drop_index(); }
         if self.eat_word("insert") { return self.insert(); }
         if self.eat_word("select") { return self.select(); }
         if self.eat_word("update") { return self.update(); }
@@ -257,6 +323,14 @@ impl Parser {
     }
 
     fn create(&mut self) -> Result<Stmt> {
+        if self.eat_word("unique") {
+            // A unique index is an ordinary one here. Refusing a
+            // repeated value is phase 4 work that nothing asks for yet,
+            // and pretending would be worse than saying so.
+            self.want_word("index")?;
+            return self.create_index();
+        }
+        if self.eat_word("index") { return self.create_index(); }
         self.want_word("table")?;
         let if_missing = if self.eat_word("if") {
             self.want_word("not")?;
@@ -292,6 +366,32 @@ impl Parser {
         }
         self.want_sym(')')?;
         Ok(Stmt::CreateTable { name, columns, if_missing })
+    }
+
+    fn create_index(&mut self) -> Result<Stmt> {
+        let if_missing = if self.eat_word("if") {
+            self.want_word("not")?;
+            self.want_word("exists")?;
+            true
+        } else {
+            false
+        };
+        let name = self.name()?;
+        self.want_word("on")?;
+        let table = self.name()?;
+        self.want_sym('(')?;
+        let column = self.name()?;
+        self.eat_word("asc");
+        self.eat_word("desc");
+        self.want_sym(')')?;
+        Ok(Stmt::CreateIndex { name, table, column, if_missing })
+    }
+
+    fn drop_index(&mut self) -> Result<Stmt> {
+        self.want_word("index")?;
+        let if_there = if self.eat_word("if") { self.want_word("exists")?; true } else { false };
+        let name = self.name()?;
+        Ok(Stmt::DropIndex { name, if_there })
     }
 
     fn kind(&mut self) -> Result<Kind> {
@@ -331,19 +431,21 @@ impl Parser {
     fn select(&mut self) -> Result<Stmt> {
         let project = if self.eat_sym('*') {
             Project::All
-        } else if self.is_count() {
-            Project::Count
+        } else if let Some(aggs) = self.aggregates()? {
+            Project::Aggs(aggs)
         } else {
             let mut cols = Vec::new();
             loop {
-                cols.push(self.name()?);
+                cols.push(self.qualified()?);
                 if !self.eat_sym(',') { break; }
             }
             Project::Columns(cols)
         };
         self.want_word("from")?;
         let table = self.name()?;
+        let join = self.join_clause()?;
         let filter = self.where_clause()?;
+        let order = self.order_clause()?;
         let limit = if self.eat_word("limit") {
             match self.next() {
                 Some(Tok::Int(n)) if n >= 0 => Some(n as usize),
@@ -352,17 +454,71 @@ impl Parser {
         } else {
             None
         };
-        Ok(Stmt::Select { table, project, filter, limit })
+        Ok(Stmt::Select { table, join, project, filter, order, limit })
     }
 
-    /// `COUNT(*)`, stepped over when it is there.
-    fn is_count(&mut self) -> bool {
+    /// A select list made only of COUNT, SUM, MIN and MAX. Anything else
+    /// leaves the parser where it was.
+    fn aggregates(&mut self) -> Result<Option<Vec<Agg>>> {
         let save = self.at;
-        if self.eat_word("count") && self.eat_sym('(') && self.eat_sym('*') && self.eat_sym(')') {
-            return true;
+        let mut out = Vec::new();
+        loop {
+            let Some(a) = self.one_aggregate()? else { self.at = save; return Ok(None) };
+            out.push(a);
+            if !self.eat_sym(',') { break; }
         }
-        self.at = save;
-        false
+        // Only a list that is entirely aggregates counts.
+        if let Some(Tok::Word(w)) = self.peek() {
+            if !w.eq_ignore_ascii_case("from") { self.at = save; return Ok(None); }
+        }
+        Ok(Some(out))
+    }
+
+    fn one_aggregate(&mut self) -> Result<Option<Agg>> {
+        let save = self.at;
+        let Some(Tok::Word(w)) = self.peek().cloned() else { return Ok(None) };
+        let func = match w.to_ascii_uppercase().as_str() {
+            "COUNT" => Func::Count,
+            "SUM" => Func::Sum,
+            "MIN" => Func::Min,
+            "MAX" => Func::Max,
+            _ => return Ok(None),
+        };
+        self.at += 1;
+        if !self.eat_sym('(') { self.at = save; return Ok(None); }
+        let arg = if self.eat_sym('*') { None } else { Some(self.qualified()?) };
+        if !self.eat_sym(')') { return Err(sql_err("I expected ) after the column")); }
+        if func != Func::Count && arg.is_none() {
+            return Err(sql_err("only COUNT can take a star"));
+        }
+        Ok(Some(Agg { func, arg }))
+    }
+
+    fn join_clause(&mut self) -> Result<Option<Join>> {
+        self.eat_word("inner");
+        if !self.eat_word("join") { return Ok(None); }
+        let table = self.name()?;
+        self.want_word("on")?;
+        let left = self.qualified()?;
+        if self.peek() != Some(&Tok::Cmp(Cmp::Eq)) {
+            return Err(sql_err("a join is on one column being equal to another"));
+        }
+        self.at += 1;
+        let right = self.qualified()?;
+        Ok(Some(Join { table, left, right }))
+    }
+
+    fn order_clause(&mut self) -> Result<Vec<Order>> {
+        if !self.eat_word("order") { return Ok(Vec::new()); }
+        self.want_word("by")?;
+        let mut out = Vec::new();
+        loop {
+            let name = self.qualified()?;
+            let desc = if self.eat_word("desc") { true } else { self.eat_word("asc"); false };
+            out.push(Order { name, desc });
+            if !self.eat_sym(',') { break; }
+        }
+        Ok(out)
     }
 
     fn update(&mut self) -> Result<Stmt> {
@@ -394,7 +550,7 @@ impl Parser {
         if !self.eat_word("where") { return Ok(Vec::new()); }
         let mut out = Vec::new();
         loop {
-            let column = self.name()?;
+            let column = self.qualified()?;
             let cmp = match self.next() {
                 Some(Tok::Cmp(c)) => c,
                 _ => return Err(sql_err("I expected a comparison here")),
@@ -513,13 +669,89 @@ mod tests {
     }
 
     #[test]
-    fn select_takes_a_star_a_list_or_a_count() {
+    fn select_takes_a_star_a_list_or_an_aggregate() {
         let Stmt::Select { project, .. } = parse("SELECT * FROM kv").unwrap() else { panic!() };
         assert_eq!(project, Project::All);
         let Stmt::Select { project, .. } = parse("SELECT a, c FROM kv").unwrap() else { panic!() };
-        assert_eq!(project, Project::Columns(vec!["a".into(), "c".into()]));
+        assert_eq!(project, Project::Columns(vec![Name::bare("a"), Name::bare("c")]));
         let Stmt::Select { project, .. } = parse("SELECT COUNT(*) FROM kv").unwrap() else { panic!() };
-        assert_eq!(project, Project::Count);
+        assert_eq!(project, Project::Aggs(vec![Agg { func: Func::Count, arg: None }]));
+    }
+
+    #[test]
+    fn every_aggregate_parses() {
+        for (text, func) in [("SUM", Func::Sum), ("MIN", Func::Min), ("MAX", Func::Max)] {
+            let s = parse(&format!("SELECT {text}(a) FROM kv")).unwrap();
+            let Stmt::Select { project, .. } = s else { panic!() };
+            assert_eq!(project, Project::Aggs(vec![Agg { func, arg: Some(Name::bare("a")) }]));
+        }
+        let s = parse("SELECT COUNT(*), SUM(a), MIN(b), MAX(c) FROM kv").unwrap();
+        let Stmt::Select { project, .. } = s else { panic!() };
+        let Project::Aggs(aggs) = project else { panic!() };
+        assert_eq!(aggs.len(), 4);
+        // Only COUNT may take a star.
+        assert!(parse("SELECT SUM(*) FROM kv").is_err());
+        // A column called count is still a column.
+        let s = parse("SELECT count FROM kv").unwrap();
+        let Stmt::Select { project, .. } = s else { panic!() };
+        assert_eq!(project, Project::Columns(vec![Name::bare("count")]));
+    }
+
+    #[test]
+    fn a_name_can_say_its_table() {
+        let s = parse("SELECT a.x, y FROM a WHERE a.z = 1").unwrap();
+        let Stmt::Select { project, filter, .. } = s else { panic!() };
+        assert_eq!(
+            project,
+            Project::Columns(vec![
+                Name { table: Some("a".into()), column: "x".into() },
+                Name::bare("y"),
+            ])
+        );
+        assert_eq!(filter[0].column, Name { table: Some("a".into()), column: "z".into() });
+    }
+
+    #[test]
+    fn a_join_says_what_is_equal_to_what() {
+        let s = parse("SELECT a.x FROM a JOIN b ON a.k = b.id WHERE b.y > 1").unwrap();
+        let Stmt::Select { join, filter, .. } = s else { panic!() };
+        let join = join.unwrap();
+        assert_eq!(join.table, "b");
+        assert_eq!(join.left, Name { table: Some("a".into()), column: "k".into() });
+        assert_eq!(join.right, Name { table: Some("b".into()), column: "id".into() });
+        assert_eq!(filter.len(), 1);
+        assert!(parse("SELECT x FROM a INNER JOIN b ON a.k = b.id").is_ok());
+        assert!(parse("SELECT x FROM a JOIN b ON a.k > b.id").is_err());
+    }
+
+    #[test]
+    fn order_by_takes_a_direction_and_a_list() {
+        let s = parse("SELECT a FROM kv ORDER BY a DESC, b, c ASC LIMIT 5").unwrap();
+        let Stmt::Select { order, limit, .. } = s else { panic!() };
+        assert_eq!(order.len(), 3);
+        assert!(order[0].desc);
+        assert!(!order[1].desc);
+        assert!(!order[2].desc);
+        assert_eq!(limit, Some(5));
+    }
+
+    #[test]
+    fn an_index_is_made_and_dropped_by_name() {
+        let s = parse("CREATE INDEX kv_a ON kv (a)").unwrap();
+        assert_eq!(
+            s,
+            Stmt::CreateIndex {
+                name: "kv_a".into(),
+                table: "kv".into(),
+                column: "a".into(),
+                if_missing: false
+            }
+        );
+        let s = parse("CREATE UNIQUE INDEX IF NOT EXISTS kv_a ON kv (a DESC)").unwrap();
+        let Stmt::CreateIndex { if_missing, .. } = s else { panic!() };
+        assert!(if_missing);
+        assert_eq!(parse("DROP INDEX kv_a").unwrap(), Stmt::DropIndex { name: "kv_a".into(), if_there: false });
+        assert_eq!(parse("DROP INDEX IF EXISTS kv_a").unwrap(), Stmt::DropIndex { name: "kv_a".into(), if_there: true });
     }
 
     #[test]

@@ -15,7 +15,9 @@
 use ferrite::{Db, Value};
 use rusqlite::{types::ValueRef, Connection};
 
-const SCHEMA: &str = "CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b REAL, c TEXT)";
+const SCHEMA: &str = "\
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b REAL, c TEXT);\
+    CREATE TABLE u (id INTEGER PRIMARY KEY, ref INTEGER, tag TEXT);";
 
 /// The same repeatable stream the bench uses.
 struct Rng(u64);
@@ -49,7 +51,7 @@ fn c_value(rng: &mut Rng) -> String {
     format!("'{}'", words[rng.below(words.len() as u64) as usize])
 }
 
-/// A condition on one of the columns.
+/// A condition on one of the columns of `t`.
 fn a_condition(rng: &mut Rng) -> String {
     let cmp = ["=", "<>", "<", "<=", ">", ">="][rng.below(6) as usize];
     match rng.below(4) {
@@ -71,6 +73,31 @@ fn a_where(rng: &mut Rng) -> String {
 
 /// A statement that changes something.
 fn a_change(rng: &mut Rng) -> String {
+    // Now and then, put an index up or take one down. Both engines then
+    // have the choice of using it, and both have to answer the same.
+    if rng.one_in(40) {
+        let which = rng.below(4);
+        return match which {
+            0 => "CREATE INDEX ix_a ON t (a)".into(),
+            1 => "DROP INDEX ix_a".into(),
+            2 => "CREATE INDEX ix_ref ON u (ref)".into(),
+            _ => "DROP INDEX ix_ref".into(),
+        };
+    }
+    if rng.one_in(3) {
+        // The second table, which the first one is joined to.
+        return match rng.below(6) {
+            0..=3 => format!(
+                "INSERT INTO u (id, ref, tag) VALUES ({}, {}, {})",
+                rng.below(30),
+                if rng.one_in(9) { "NULL".to_string() } else { rng.below(30).to_string() },
+                c_value(rng)
+            ),
+            4 => format!("UPDATE u SET ref = {}", rng.below(30)),
+            _ => format!("DELETE FROM u WHERE id {} {}",
+                         ["=", "<", ">"][rng.below(3) as usize], rng.below(30)),
+        };
+    }
     match rng.below(10) {
         0..=5 => format!(
             "INSERT INTO t (id, a, b, c) VALUES ({}, {}, {}, {})",
@@ -89,11 +116,82 @@ fn a_change(rng: &mut Rng) -> String {
     }
 }
 
+/// A question to put to both engines. When the rows come back in an
+/// order the query asked for, they are compared in that order.
+struct Query {
+    sql: String,
+    ordered: bool,
+}
+
 /// A statement that reads.
-fn a_query(rng: &mut Rng) -> String {
-    let what = ["*", "id", "a", "c", "id, a", "a, b, c", "COUNT(*)"][rng.below(7) as usize];
-    let limit = if rng.one_in(5) { format!(" LIMIT {}", rng.below(5)) } else { String::new() };
-    format!("SELECT {what} FROM t{}{limit}", a_where(rng))
+fn a_query(rng: &mut Rng) -> Query {
+    match rng.below(10) {
+        // Aggregates, which give one row.
+        0..=1 => {
+            let what = [
+                "COUNT(*)",
+                "COUNT(a)",
+                "SUM(a)",
+                "SUM(b)",
+                "MIN(a), MAX(a)",
+                "MIN(c), MAX(c)",
+                "COUNT(*), SUM(a), MIN(b), MAX(c)",
+            ][rng.below(7) as usize];
+            Query { sql: format!("SELECT {what} FROM t{}", a_where(rng)), ordered: false }
+        }
+        // A join, one way round or the other.
+        2..=3 => {
+            let (from, on) = if rng.one_in(2) {
+                ("t JOIN u", "t.id = u.ref")
+            } else {
+                ("u JOIN t", "u.ref = t.id")
+            };
+            let what = ["t.id, u.id", "t.a, u.tag", "u.id, t.c", "COUNT(*)"][rng.below(4) as usize];
+            let filter = if rng.one_in(3) {
+                format!(" WHERE t.a {} {}", ["<", ">", "="][rng.below(3) as usize], rng.below(20) as i64 - 10)
+            } else if rng.one_in(3) {
+                format!(" WHERE u.tag = {}", c_value(rng))
+            } else {
+                String::new()
+            };
+            if what == "COUNT(*)" {
+                return Query { sql: format!("SELECT {what} FROM {from} ON {on}{filter}"), ordered: false };
+            }
+            // Both keys on the end make the order total, so the two
+            // engines cannot differ over how ties are laid out.
+            Query {
+                sql: format!("SELECT {what} FROM {from} ON {on}{filter} ORDER BY t.id, u.id"),
+                ordered: true,
+            }
+        }
+        // A join on a plain column rather than a key.
+        4 => Query {
+            sql: format!(
+                "SELECT t.id, u.id FROM t JOIN u ON t.a = u.ref{} ORDER BY t.id, u.id",
+                if rng.one_in(2) { format!(" WHERE t.id < {}", rng.below(30)) } else { String::new() }
+            ),
+            ordered: true,
+        },
+        // Plain rows, sorted.
+        5..=6 => {
+            let what = ["*", "id", "a", "c", "id, a"][rng.below(5) as usize];
+            let by = ["a", "b", "c", "id"][rng.below(4) as usize];
+            let dir = if rng.one_in(2) { " DESC" } else { "" };
+            let limit = if rng.one_in(3) { format!(" LIMIT {}", rng.below(6)) } else { String::new() };
+            Query {
+                sql: format!("SELECT {what} FROM t{} ORDER BY {by}{dir}, id{limit}", a_where(rng)),
+                ordered: true,
+            }
+        }
+        // Plain rows, in no order anyone asked for. No LIMIT here: a
+        // limit with nothing to sort by takes whichever rows the engine
+        // happened to walk first, and an index changes that. Both
+        // answers are right and they are not the same.
+        _ => {
+            let what = ["*", "id", "a", "c", "id, a", "a, b, c"][rng.below(6) as usize];
+            Query { sql: format!("SELECT {what} FROM t{}", a_where(rng)), ordered: false }
+        }
+    }
 }
 
 // ── Reading the answers ────────────────────────────────────────────────
@@ -174,7 +272,9 @@ fn run_it(seed: u64, rounds: usize, place: Where) {
             Db::open(dir).expect("open")
         }
     };
-    db.execute(SCHEMA, &[]).expect("ferrite schema");
+    for one in SCHEMA.split(';').filter(|s| !s.trim().is_empty()) {
+        db.execute(one, &[]).expect("ferrite schema");
+    }
 
     let mut rng = Rng::new(seed);
     let mut queries = 0usize;
@@ -189,13 +289,16 @@ fn run_it(seed: u64, rounds: usize, place: Where) {
                 drop(db);
                 db = Db::open(dir).expect("reopen");
                 reopens += 1;
-                let mine = sorted(db.query("SELECT * FROM t", &[]).unwrap().rows().to_vec());
-                let theirs = sorted(sqlite_rows(&conn, "SELECT * FROM t").unwrap());
-                assert!(
-                    agree(&theirs, &mine),
-                    "seed {seed}, round {round}: reopening gave a different database\n  \
-                     sqlite:  {theirs:?}\n  ferrite: {mine:?}"
-                );
+                for table in ["t", "u"] {
+                    let ask = format!("SELECT * FROM {table}");
+                    let mine = sorted(db.query(&ask, &[]).unwrap().rows().to_vec());
+                    let theirs = sorted(sqlite_rows(&conn, &ask).unwrap());
+                    assert!(
+                        agree(&theirs, &mine),
+                        "seed {seed}, round {round}: reopening gave a different {table}\n  \
+                         sqlite:  {theirs:?}\n  ferrite: {mine:?}"
+                    );
+                }
             }
         }
         let sql = a_change(&mut rng);
@@ -208,33 +311,47 @@ fn run_it(seed: u64, rounds: usize, place: Where) {
              {sql}\n  sqlite: {theirs:?}\n  ferrite: {:?}",
             mine.as_ref().err()
         );
-        if let (Ok(n), Ok(out)) = (&theirs, &mine) {
-            assert_eq!(
-                *n,
-                out.changed(),
-                "seed {seed}, round {round}: different number of rows changed\n  {sql}"
-            );
+        // How many rows changed is only a question for statements that
+        // change rows. After a CREATE INDEX, SQLite reports whatever the
+        // count happened to be beforehand.
+        let touches_rows = !sql.starts_with("CREATE") && !sql.starts_with("DROP");
+        if touches_rows {
+            if let (Ok(n), Ok(out)) = (&theirs, &mine) {
+                assert_eq!(
+                    *n,
+                    out.changed(),
+                    "seed {seed}, round {round}: different number of rows changed\n  {sql}"
+                );
+            }
         }
 
         // Every few changes, ask both the same questions.
         if round % 3 == 0 {
             for _ in 0..3 {
                 let q = a_query(&mut rng);
-                let theirs = sqlite_rows(&conn, &q);
-                let mine = db.query(&q, &[]);
+                let theirs = sqlite_rows(&conn, &q.sql);
+                let mine = db.query(&q.sql, &[]);
                 match (theirs, mine) {
                     (Ok(theirs), Ok(mine)) => {
-                        let mine = sorted(mine.rows().to_vec());
-                        let theirs = sorted(theirs);
+                        let mut mine = mine.rows().to_vec();
+                        let mut theirs = theirs;
+                        // A query that asked for an order is checked in
+                        // that order. One that did not is checked as a
+                        // set, because neither engine promised an order.
+                        if !q.ordered {
+                            mine = sorted(mine);
+                            theirs = sorted(theirs);
+                        }
                         assert!(
                             agree(&theirs, &mine),
-                            "seed {seed}, round {round}: different answers\n  {q}\n  \
-                             sqlite:  {theirs:?}\n  ferrite: {mine:?}"
+                            "seed {seed}, round {round}: different answers\n  {}\n  \
+                             sqlite:  {theirs:?}\n  ferrite: {mine:?}",
+                            q.sql
                         );
                         queries += 1;
                     }
-                    (Err(t), Ok(_)) => panic!("seed {seed}: sqlite refused {q}: {t}"),
-                    (Ok(_), Err(m)) => panic!("seed {seed}: ferrite refused {q}: {m}"),
+                    (Err(t), Ok(_)) => panic!("seed {seed}: sqlite refused {}: {t}", q.sql),
+                    (Ok(_), Err(m)) => panic!("seed {seed}: ferrite refused {}: {m}", q.sql),
                     (Err(_), Err(_)) => {}
                 }
             }

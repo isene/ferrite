@@ -106,6 +106,10 @@ pub enum Change {
     Set { table: u32, key: i64, col: u32, value: Value },
     Delete { table: u32, key: i64 },
     DropTable { name: String },
+    /// An index is only its definition. What is in it can be worked out
+    /// again from the rows, so none of that goes to the log.
+    NewIndex { name: String, table: u32, column: String },
+    DropIndex { name: String },
 }
 
 impl PartialEq for Column {
@@ -177,6 +181,16 @@ fn put_change(out: &mut Vec<u8>, c: &Change) {
         }
         Change::DropTable { name } => {
             out.push(4);
+            put_str(out, name);
+        }
+        Change::NewIndex { name, table, column } => {
+            out.push(6);
+            put_str(out, name);
+            put_u32(out, *table);
+            put_str(out, column);
+        }
+        Change::DropIndex { name } => {
+            out.push(7);
             put_str(out, name);
         }
     }
@@ -318,6 +332,12 @@ impl<'a> Reader<'a> {
                 value: self.value()?,
             },
             4 => Change::DropTable { name: self.string()? },
+            6 => Change::NewIndex {
+                name: self.string()?,
+                table: self.u32()?,
+                column: self.string()?,
+            },
+            7 => Change::DropIndex { name: self.string()? },
             _ => return None,
         })
     }
@@ -574,6 +594,8 @@ mod tests {
             Change::Set { table: 0, key: 8, col: 0, value: Value::Int(4) },
             Change::Delete { table: 0, key: 7 },
             Change::DropTable { name: "old".into() },
+            Change::NewIndex { name: "kv_a".into(), table: 0, column: "a".into() },
+            Change::DropIndex { name: "kv_a".into() },
         ]
     }
 

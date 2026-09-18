@@ -234,6 +234,50 @@ insert.** Changes are now written as bytes as they happen, straight from
 the row, and a commit is one buffer with its header filled in at the
 end.
 
+## Phase 4: indexes, joins, sorting and the aggregates
+
+`CREATE INDEX`, an inner join, `ORDER BY`, `SUM`, `MIN` and `MAX`, on top
+of what was already there.
+
+**A lookup on a column that is not the key**, 100,000 rows, one value in
+a hundred, so about a thousand rows come back each time.
+
+| engine | walking | with an index | |
+|---|---|---|---|
+| ferrite | 5 039 µs | 286 µs | 18 times |
+| SQLite | 3 574 µs | 68 µs | 53 times |
+
+SQLite's indexed lookup is four times quicker than ferrite's, and that
+is fair to say plainly. ferrite's index maps a value to the keys that
+hold it, so every matching row costs a second walk down the row tree.
+SQLite's index hands back its rowids in one run. Phase 5.
+
+`COUNT(*)` is the one place ferrite is far ahead, at 0.1 µs against 33.
+A count with nothing else to check never needs the rows: the table knows
+how many it holds, and an index knows how many hold a given value.
+Fetching each row to add one to a counter is work for nothing.
+
+**What the random SQL now covers.** Two tables, joins both ways round,
+joins onto a plain column, ORDER BY in both directions, the four
+aggregates, and indexes made and dropped as the run goes. Both in memory
+and on disk, with the database closed and opened again every fifty
+rounds. Every answer matches SQLite.
+
+Two things the test taught rather than the engine:
+
+- **A LIMIT with no ORDER BY is not comparable between engines.** It
+  takes whichever rows the engine walked first, and making an index
+  changes that. Both answers are right and they are not the same, so the
+  generator no longer writes one.
+- **How many rows changed is only a question for statements that change
+  rows.** After a CREATE INDEX, SQLite reports whatever the count
+  happened to be beforehand.
+
+**One thing to know about prepared statements.** A plan is settled
+when the statement is prepared, index and all. One prepared before an
+index was made still answers correctly, and still walks the table.
+Prepare it again to pick the index up.
+
 ## A trap this bench fell into
 
 The first run reported a 3 µs fsync and near-identical FULL and NORMAL

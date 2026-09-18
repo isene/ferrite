@@ -501,6 +501,87 @@ fn phase2_gate(rows: u64, batches: u64, per_batch: u64) -> (f64, f64) {
     (plain[plain.len() / 2] as f64, sql[sql.len() / 2] as f64)
 }
 
+// ── What an index buys ─────────────────────────────────────────────────
+
+/// A lookup on a column that is not the key, with and without an index
+/// on it, on both engines.
+///
+/// Without one there is nothing to do but look at every row, so the cost
+/// grows with the table. With one it is a lookup and then only the rows
+/// that matched.
+fn index_gain(rows: u64) -> Vec<(&'static str, f64, f64)> {
+    use ferrite::{Db, Value};
+
+    // A hundred values, so each one picks out about a thousandth of the
+    // table.
+    let spread = 100u64;
+    let mut out = Vec::new();
+
+    let mut db = Db::new();
+    db.execute("CREATE TABLE kv (id INTEGER PRIMARY KEY, a INTEGER, c TEXT)", &[]).unwrap();
+    let put = db.prepare("INSERT INTO kv (id, a, c) VALUES (?1, ?2, ?3)").unwrap();
+    db.execute("BEGIN", &[]).unwrap();
+    for i in 0..rows {
+        put.run(&mut db, &[Value::Int(i as i64), Value::Int((i % spread) as i64), Value::Text(format!("row {i}"))])
+            .unwrap();
+    }
+    db.execute("COMMIT", &[]).unwrap();
+    // Rows, not a count. A count off an index is a special case that
+    // ferrite answers by reading how many keys are filed under a value,
+    // and measuring that would say nothing about ordinary work.
+    let sql = "SELECT id FROM kv WHERE a = ?1";
+    let ask = db.prepare(sql).unwrap();
+
+    let mut timed = |db: &Db, ask: &ferrite::Statement, ops: u64| -> f64 {
+        let mut rng = Rng::new(7);
+        let t0 = Instant::now();
+        for _ in 0..ops {
+            let v = rng.below(spread) as i64;
+            let _ = ask.query(db, &[Value::Int(v)]).unwrap();
+        }
+        t0.elapsed().as_nanos() as f64 / ops as f64 / 1000.0
+    };
+    let walked = timed(&db, &ask, 200);
+    db.execute("CREATE INDEX kv_a ON kv (a)", &[]).unwrap();
+    // A plan is fixed when the statement is prepared, so one prepared
+    // before the index knows nothing about it. Prepare it again.
+    // Rows, not a count. A count off an index is a special case that
+    // ferrite answers by reading how many keys are filed under a value,
+    // and measuring that would say nothing about ordinary work.
+    let sql = "SELECT id FROM kv WHERE a = ?1";
+    let ask = db.prepare(sql).unwrap();
+    let looked = timed(&db, &ask, 5_000);
+    out.push(("ferrite", walked, looked));
+
+    // The same on SQLite, so the gain is not just ours to claim.
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch("CREATE TABLE kv (id INTEGER PRIMARY KEY, a INTEGER, c TEXT)").unwrap();
+    conn.execute_batch("BEGIN").unwrap();
+    {
+        let mut put = conn.prepare("INSERT INTO kv (id, a, c) VALUES (?1, ?2, ?3)").unwrap();
+        for i in 0..rows {
+            put.execute(rusqlite::params![i as i64, (i % spread) as i64, format!("row {i}")]).unwrap();
+        }
+    }
+    conn.execute_batch("COMMIT").unwrap();
+    let mut their_time = |ops: u64| -> f64 {
+        let mut ask = conn.prepare("SELECT id FROM kv WHERE a = ?1").unwrap();
+        let mut rng = Rng::new(7);
+        let t0 = Instant::now();
+        for _ in 0..ops {
+            let v = rng.below(spread) as i64;
+            let mut got = ask.query(rusqlite::params![v]).unwrap();
+            while got.next().unwrap().is_some() {}
+        }
+        t0.elapsed().as_nanos() as f64 / ops as f64 / 1000.0
+    };
+    let their_walk = their_time(200);
+    conn.execute_batch("CREATE INDEX kv_a ON kv (a)").unwrap();
+    let their_look = their_time(5_000);
+    out.push(("SQLite", their_walk, their_look));
+    out
+}
+
 // ── The fsync floor ────────────────────────────────────────────────────
 
 /// How long one small append takes to reach the disk for certain. Every
@@ -769,6 +850,14 @@ fn main() {
         }
         table(&title, &mut runs);
         let _ = std::fs::remove_dir_all(&path);
+    }
+
+    // What an index is for.
+    let gain = index_gain(ROWS);
+    println!("\nA lookup on a column that is not the key, {ROWS} rows, one value in a hundred");
+    println!("  {:<10}{:>14}{:>14}{:>10}", "engine", "walking µs", "indexed µs", "times");
+    for (who, walked, looked) in gain.iter() {
+        println!("  {:<10}{:>14.1}{:>14.2}{:>10.0}", who, walked, looked, walked / looked);
     }
 }
 

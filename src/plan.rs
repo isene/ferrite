@@ -1,9 +1,9 @@
 //! Turning a parsed statement into something that runs.
 //!
 //! Planning happens once. It looks every table and column name up, works
-//! out whether the WHERE can go straight to a key, and leaves behind a
-//! [`Statement`] holding numbers rather than names. Running it then costs
-//! an array index and a B-tree lookup.
+//! out whether the WHERE can go straight to a key or through an index,
+//! and leaves behind a [`Statement`] holding numbers rather than names.
+//! Running it then costs an array index and a B-tree lookup.
 //!
 //! That is the whole point of a prepared statement, and it is what the
 //! phase 2 gate measures: a prepared lookup by key has to cost within
@@ -11,15 +11,21 @@
 
 use std::cmp::Ordering;
 
-use crate::sql::{self, Cmp, ColDef, Expr, Project, Stmt};
-use crate::{Column, Db, Error, Result, Row, TableId, Value};
+use crate::sql::{self, Agg, Cmp, ColDef, Expr, Func, Name, Project, Stmt};
+use crate::{Column, Db, Error, IndexId, Result, Row, SortKey, TableId, Value};
 
-/// Where a value comes from in a row: the key it is filed under, or one
-/// of the stored columns.
+/// Where a value comes from: which of the tables the query names, and
+/// either the key a row is filed under or one of its stored columns.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Pick {
-    Key,
-    Col(usize),
+    Key(u8),
+    Col(u8, usize),
+}
+
+impl Pick {
+    fn side(&self) -> u8 {
+        match self { Pick::Key(s) | Pick::Col(s, _) => *s }
+    }
 }
 
 /// One condition, with its column already resolved.
@@ -30,11 +36,13 @@ pub struct Test {
     value: Expr,
 }
 
-/// How the rows to work on are found. Going straight to a key is the
-/// difference between a lookup and a walk over the whole table.
+/// How the rows of the first table are found. Going straight to a key,
+/// or through an index, is the difference between a lookup and a walk
+/// over everything.
 #[derive(Debug, Clone)]
 enum Find {
     Key(Expr),
+    Index { index: IndexId, value: Expr },
     Range { low: Option<(Cmp, Expr)>, high: Option<(Cmp, Expr)> },
     All,
 }
@@ -42,19 +50,56 @@ enum Find {
 #[derive(Debug, Clone)]
 struct Where {
     find: Find,
+    /// Conditions on the first table, which can be checked before the
+    /// second is looked at.
     tests: Vec<Test>,
+    /// Conditions that need both tables.
+    after_join: Vec<Test>,
+}
+
+/// How the second table's matching rows are found, given a row of the
+/// first.
+#[derive(Debug, Clone)]
+enum JoinBy {
+    /// The joined column is that table's primary key: one lookup.
+    Key,
+    /// The joined column has an index: one lookup, however many rows.
+    Index(IndexId),
+    /// Neither, so every row has to be looked at. Right, and slow.
+    Scan(usize),
+}
+
+#[derive(Debug, Clone)]
+struct Joined {
+    table: TableId,
+    /// The value on the first table that is matched.
+    left: Pick,
+    by: JoinBy,
+}
+
+#[derive(Debug, Clone)]
+struct Sort {
+    pick: Pick,
+    desc: bool,
+}
+
+#[derive(Debug, Clone)]
+struct Counting {
+    func: Func,
+    /// What it is over. `COUNT(*)` has nothing.
+    arg: Option<Pick>,
 }
 
 #[derive(Debug, Clone)]
 enum What {
     Row(Vec<Pick>),
-    Count,
+    Aggs(Vec<Counting>),
 }
 
 /// A lookup of one stored column by key, worked out once at prepare
-/// time. Checking the shape of the plan on every call is exactly the
-/// overhead a prepared statement exists to remove, so it is done here
-/// and never again.
+/// time. Checking the shape of the plan on every call is the overhead a
+/// prepared statement exists to remove, so it is done here and never
+/// again.
 #[derive(Debug, Clone)]
 struct Fast {
     table: TableId,
@@ -74,8 +119,17 @@ pub struct Statement {
 #[derive(Debug, Clone)]
 enum Plan {
     CreateTable { name: String, key: String, columns: Vec<Column>, if_missing: bool },
+    CreateIndex { name: String, table: String, column: String, if_missing: bool },
+    DropIndex { name: String, if_there: bool },
     Insert { table: TableId, key: Expr, values: Vec<Expr> },
-    Select { table: TableId, what: What, filter: Where, limit: Option<usize> },
+    Select {
+        table: TableId,
+        join: Option<Joined>,
+        what: What,
+        filter: Where,
+        order: Vec<Sort>,
+        limit: Option<usize>,
+    },
     Update { table: TableId, sets: Vec<(usize, Expr)>, filter: Where },
     Delete { table: TableId, filter: Where },
     Begin,
@@ -103,7 +157,56 @@ impl Outcome {
     }
 }
 
+/// Whether a statement reads or changes something.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Kind2 { Reads, Changes }
+
 fn err(what: &str) -> Error { Error::Sql(what.to_string()) }
+
+// ── Working out which table a name means ───────────────────────────────
+
+/// The tables a query can name, in the order they were written.
+struct Scope<'a> {
+    db: &'a Db,
+    sides: Vec<(String, TableId)>,
+}
+
+impl Scope<'_> {
+    fn pick(&self, n: &Name) -> Result<Pick> {
+        match &n.table {
+            Some(want) => {
+                let side = self
+                    .sides
+                    .iter()
+                    .position(|(name, _)| name.eq_ignore_ascii_case(want))
+                    .ok_or_else(|| err(&format!("the query has no table called {want}")))?;
+                self.in_side(side as u8, &n.column)
+                    .ok_or_else(|| err(&format!("{want} has no column called {}", n.column)))
+            }
+            None => {
+                let mut found = None;
+                for side in 0..self.sides.len() {
+                    if let Some(p) = self.in_side(side as u8, &n.column) {
+                        if found.is_some() {
+                            return Err(err(&format!(
+                                "both tables have a column called {}; say which one",
+                                n.column
+                            )));
+                        }
+                        found = Some(p);
+                    }
+                }
+                found.ok_or_else(|| err(&format!("there is no column called {}", n.column)))
+            }
+        }
+    }
+
+    fn in_side(&self, side: u8, column: &str) -> Option<Pick> {
+        let t = self.db.table(self.sides[side as usize].1);
+        if column.eq_ignore_ascii_case(t.key_name()) { return Some(Pick::Key(side)); }
+        t.column_of(column).map(|i| Pick::Col(side, i))
+    }
+}
 
 // ── Planning ───────────────────────────────────────────────────────────
 
@@ -116,8 +219,20 @@ pub fn plan(db: &Db, sql: &str) -> Result<Statement> {
         Stmt::Commit => Plan::Commit,
         Stmt::Rollback => Plan::Rollback,
         Stmt::CreateTable { name, columns, if_missing } => create(name, columns, if_missing)?,
+        Stmt::CreateIndex { name, table, column, if_missing } => {
+            // Checked here so that a name that is not there is caught at
+            // prepare time like everything else.
+            let id = db.table_id(&table)?;
+            if db.table(id).column_of(&column).is_none() {
+                return Err(err(&format!("{table} has no column called {column}")));
+            }
+            Plan::CreateIndex { name, table, column, if_missing }
+        }
+        Stmt::DropIndex { name, if_there } => Plan::DropIndex { name, if_there },
         Stmt::Insert { table, columns, values } => insert(db, table, columns, values)?,
-        Stmt::Select { table, project, filter, limit } => select(db, table, project, filter, limit)?,
+        Stmt::Select { table, join, project, filter, order, limit } => {
+            select(db, table, join, project, filter, order, limit)?
+        }
         Stmt::Update { table, sets, filter } => update(db, table, sets, filter)?,
         Stmt::Delete { table, filter } => delete(db, table, filter)?,
     };
@@ -128,9 +243,15 @@ pub fn plan(db: &Db, sql: &str) -> Result<Statement> {
 /// Recognise `SELECT one_stored_column FROM t WHERE key = x` with
 /// nothing else to check.
 fn fast_path(plan: &Plan) -> Option<Fast> {
-    let Plan::Select { table, what: What::Row(picks), filter, limit } = plan else { return None };
-    if picks.len() != 1 || !filter.tests.is_empty() || matches!(limit, Some(0)) { return None; }
-    let Pick::Col(col) = picks[0] else { return None };
+    let Plan::Select { table, join: None, what: What::Row(picks), filter, order, limit } = plan
+    else {
+        return None;
+    };
+    if picks.len() != 1 || !filter.tests.is_empty() || !order.is_empty() || matches!(limit, Some(0))
+    {
+        return None;
+    }
+    let Pick::Col(0, col) = picks[0] else { return None };
     let Find::Key(key) = &filter.find else { return None };
     Some(Fast { table: *table, col, key: key.clone() })
 }
@@ -158,7 +279,6 @@ fn create(name: String, columns: Vec<ColDef>, if_missing: bool) -> Result<Plan> 
 fn insert(db: &Db, table: String, columns: Vec<String>, values: Vec<Expr>) -> Result<Plan> {
     let id = db.table_id(&table)?;
     let t = db.table(id);
-    // No column list means every column, key first.
     let names: Vec<String> = if columns.is_empty() {
         std::iter::once(t.key_name().to_string())
             .chain(t.columns().iter().map(|c| c.name.clone()))
@@ -182,38 +302,98 @@ fn insert(db: &Db, table: String, columns: Vec<String>, values: Vec<Expr>) -> Re
         }
     }
     let key = key.ok_or_else(|| err("the primary key has to be given"))?;
-    let values = slots
-        .into_iter()
-        .map(|s| s.unwrap_or(Expr::Lit(Value::Null)))
-        .collect();
+    let values = slots.into_iter().map(|s| s.unwrap_or(Expr::Lit(Value::Null))).collect();
     Ok(Plan::Insert { table: id, key, values })
 }
 
 fn select(
     db: &Db,
     table: String,
+    join: Option<sql::Join>,
     project: Project,
     filter: Vec<sql::Cond>,
+    order: Vec<sql::Order>,
     limit: Option<usize>,
 ) -> Result<Plan> {
     let id = db.table_id(&table)?;
+    let mut scope = Scope { db, sides: vec![(table.clone(), id)] };
+    let joined_id = match &join {
+        Some(j) => {
+            let jid = db.table_id(&j.table)?;
+            if j.table.eq_ignore_ascii_case(&table) {
+                return Err(err("a table cannot be joined to itself yet"));
+            }
+            scope.sides.push((j.table.clone(), jid));
+            Some(jid)
+        }
+        None => None,
+    };
+
     let what = match project {
-        Project::Count => What::Count,
         Project::All => What::Row(
-            std::iter::once(Pick::Key)
-                .chain((0..db.table(id).columns().len()).map(Pick::Col))
+            scope
+                .sides
+                .iter()
+                .enumerate()
+                .flat_map(|(side, (_, tid))| {
+                    let n = db.table(*tid).columns().len();
+                    std::iter::once(Pick::Key(side as u8))
+                        .chain((0..n).map(move |i| Pick::Col(side as u8, i)))
+                })
                 .collect(),
         ),
         Project::Columns(names) => {
             let mut picks = Vec::with_capacity(names.len());
             for n in &names {
-                picks.push(pick_of(db, id, n, &table)?);
+                picks.push(scope.pick(n)?);
             }
             What::Row(picks)
         }
+        Project::Aggs(aggs) => {
+            let mut out = Vec::with_capacity(aggs.len());
+            for Agg { func, arg } in &aggs {
+                let arg = match arg {
+                    Some(n) => Some(scope.pick(n)?),
+                    None => None,
+                };
+                out.push(Counting { func: *func, arg });
+            }
+            What::Aggs(out)
+        }
     };
-    let filter = where_of(db, id, filter, &table)?;
-    Ok(Plan::Select { table: id, what, filter, limit })
+
+    let joined = match (join, joined_id) {
+        (Some(j), Some(jid)) => {
+            let a = scope.pick(&j.left)?;
+            let b = scope.pick(&j.right)?;
+            // Whichever side names the second table is the one looked up.
+            let (left, right) = if a.side() == 0 && b.side() == 1 {
+                (a, b)
+            } else if a.side() == 1 && b.side() == 0 {
+                (b, a)
+            } else {
+                return Err(err(
+                    "a join compares a column of one table with a column of the other",
+                ));
+            };
+            let by = match right {
+                Pick::Key(_) => JoinBy::Key,
+                Pick::Col(_, col) => match db.index_on(jid, col) {
+                    Some(index) => JoinBy::Index(index),
+                    None => JoinBy::Scan(col),
+                },
+            };
+            Some(Joined { table: jid, left, by })
+        }
+        _ => None,
+    };
+
+    let filter = where_of(db, &scope, filter)?;
+    let mut sorts = Vec::with_capacity(order.len());
+    for o in &order {
+        sorts.push(Sort { pick: scope.pick(&o.name)?, desc: o.desc });
+    }
+    Ok(Plan::Select { table: id, join: joined, what, filter, order: sorts, limit })
 }
 
 fn update(db: &Db, table: String, sets: Vec<(String, Expr)>, filter: Vec<sql::Cond>) -> Result<Plan> {
@@ -229,65 +409,79 @@ fn update(db: &Db, table: String, sets: Vec<(String, Expr)>, filter: Vec<sql::Co
             .ok_or_else(|| err(&format!("{table} has no column called {name}")))?;
         resolved.push((i, value));
     }
-    let filter = where_of(db, id, filter, &table)?;
+    let scope = Scope { db, sides: vec![(table, id)] };
+    let filter = where_of(db, &scope, filter)?;
     Ok(Plan::Update { table: id, sets: resolved, filter })
 }
 
 fn delete(db: &Db, table: String, filter: Vec<sql::Cond>) -> Result<Plan> {
     let id = db.table_id(&table)?;
-    let filter = where_of(db, id, filter, &table)?;
+    let scope = Scope { db, sides: vec![(table, id)] };
+    let filter = where_of(db, &scope, filter)?;
     Ok(Plan::Delete { table: id, filter })
 }
 
-fn pick_of(db: &Db, id: TableId, name: &str, table: &str) -> Result<Pick> {
-    let t = db.table(id);
-    if name.eq_ignore_ascii_case(t.key_name()) { return Ok(Pick::Key); }
-    t.column_of(name)
-        .map(Pick::Col)
-        .ok_or_else(|| err(&format!("{table} has no column called {name}")))
-}
-
-/// Split the conditions into a way of finding rows and a list of tests
-/// still to apply. A single `key = ?` becomes a lookup; comparisons on
-/// the key become a range; everything else stays a test.
-fn where_of(db: &Db, id: TableId, conds: Vec<sql::Cond>, table: &str) -> Result<Where> {
+/// Split the conditions into a way of finding rows and the tests still
+/// to apply.
+fn where_of(db: &Db, scope: &Scope, conds: Vec<sql::Cond>) -> Result<Where> {
     let mut items: Vec<(Pick, Cmp, Expr)> = Vec::with_capacity(conds.len());
     for c in conds {
-        items.push((pick_of(db, id, &c.column, table)?, c.cmp, c.value));
+        items.push((scope.pick(&c.column)?, c.cmp, c.value));
     }
+    let first = scope.sides[0].1;
+
     // One `key = x` beats everything else. It finds at most one row, and
     // every other condition is then a test on that row. Dropping them
     // instead would answer `id = 4 AND id > 6` with row 4.
-    if let Some(i) = items.iter().position(|(p, c, _)| *p == Pick::Key && *c == Cmp::Eq) {
+    let find = if let Some(i) =
+        items.iter().position(|(p, c, _)| *p == Pick::Key(0) && *c == Cmp::Eq)
+    {
         let (_, _, key) = items.remove(i);
-        let tests = items
-            .into_iter()
-            .map(|(pick, cmp, value)| Test { pick, cmp, value })
-            .collect();
-        return Ok(Where { find: Find::Key(key), tests });
-    }
-    let mut low = None;
-    let mut high = None;
-    let mut tests = Vec::new();
-    for (pick, cmp, value) in items {
-        match (pick, cmp) {
-            (Pick::Key, Cmp::Gt) | (Pick::Key, Cmp::Ge) if low.is_none() => low = Some((cmp, value)),
-            (Pick::Key, Cmp::Lt) | (Pick::Key, Cmp::Le) if high.is_none() => high = Some((cmp, value)),
-            _ => tests.push(Test { pick, cmp, value }),
-        }
-    }
-    let find = if low.is_some() || high.is_some() {
-        Find::Range { low, high }
+        Find::Key(key)
+    } else if let Some(i) = items.iter().position(|(p, c, _)| {
+        *c == Cmp::Eq && matches!(p, Pick::Col(0, col) if db.index_on(first, *col).is_some())
+    }) {
+        let (pick, _, value) = items.remove(i);
+        let Pick::Col(_, col) = pick else { unreachable!() };
+        Find::Index { index: db.index_on(first, col).unwrap(), value }
     } else {
-        Find::All
+        let mut low = None;
+        let mut high = None;
+        let mut rest = Vec::new();
+        for (pick, cmp, value) in items.drain(..) {
+            match (pick, cmp) {
+                (Pick::Key(0), Cmp::Gt) | (Pick::Key(0), Cmp::Ge) if low.is_none() => {
+                    low = Some((cmp, value))
+                }
+                (Pick::Key(0), Cmp::Lt) | (Pick::Key(0), Cmp::Le) if high.is_none() => {
+                    high = Some((cmp, value))
+                }
+                _ => rest.push((pick, cmp, value)),
+            }
+        }
+        items = rest;
+        if low.is_some() || high.is_some() {
+            Find::Range { low, high }
+        } else {
+            Find::All
+        }
     };
-    Ok(Where { find, tests })
+
+    let mut tests = Vec::new();
+    let mut after_join = Vec::new();
+    for (pick, cmp, value) in items {
+        let t = Test { pick, cmp, value };
+        if t.pick.side() == 0 { tests.push(t) } else { after_join.push(t) }
+    }
+    Ok(Where { find, tests, after_join })
 }
 
 fn count_params(stmt: &Stmt) -> usize {
     let mut most = 0;
     let mut see = |e: &Expr| {
-        if let Expr::Param(n) = e { most = most.max(n + 1); }
+        if let Expr::Param(n) = e {
+            most = most.max(n + 1);
+        }
     };
     match stmt {
         Stmt::Insert { values, .. } => values.iter().for_each(&mut see),
@@ -305,8 +499,9 @@ fn count_params(stmt: &Stmt) -> usize {
 
 // ── Comparing ──────────────────────────────────────────────────────────
 
-/// How two values order. Null orders against nothing, not even itself,
-/// so any comparison with it comes out false, the way SQL does it.
+/// How two values order inside a WHERE. Null orders against nothing, not
+/// even itself, so any comparison with it comes out false, the way SQL
+/// does it. Sorting needs a different answer, and that is [`SortKey`].
 fn order(a: &Value, b: &Value) -> Option<Ordering> {
     match (a, b) {
         (Value::Null, _) | (_, Value::Null) => None,
@@ -332,9 +527,41 @@ fn rank(v: &Value) -> u8 {
 
 // ── Running ────────────────────────────────────────────────────────────
 
-/// Whether a statement reads or changes something.
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum Kind2 { Reads, Changes }
+/// One row of the query: the key and row of each table it names.
+type Sides<'a> = [(i64, &'a Row)];
+
+fn take(pick: Pick, sides: &Sides) -> Value {
+    match pick {
+        Pick::Key(s) => Value::Int(sides[s as usize].0),
+        Pick::Col(s, i) => sides[s as usize].1[i].clone(),
+    }
+}
+
+fn passes(tests: &[Test], sides: &Sides, params: &[Value]) -> Result<bool> {
+    for t in tests {
+        let right = value_of(&t.value, params)?;
+        let held;
+        let left = match t.pick {
+            Pick::Col(s, i) => &sides[s as usize].1[i],
+            Pick::Key(_) => {
+                held = take(t.pick, sides);
+                &held
+            }
+        };
+        match order(left, right) {
+            Some(o) if t.cmp.holds(o) => {}
+            _ => return Ok(false),
+        }
+    }
+    Ok(true)
+}
+
+fn value_of<'a>(e: &'a Expr, params: &'a [Value]) -> Result<&'a Value> {
+    match e {
+        Expr::Lit(v) => Ok(v),
+        Expr::Param(n) => params.get(*n).ok_or_else(|| err("a value is missing")),
+    }
+}
 
 impl Statement {
     /// Whether this one reads or changes something.
@@ -370,36 +597,77 @@ impl Statement {
     /// Run a statement that reads.
     pub fn query(&self, db: &Db, params: &[Value]) -> Result<Outcome> {
         self.check(params)?;
-        match &self.plan {
-            Plan::Select { table, what, filter, limit } => {
-                let t = db.table(*table);
-                match what {
-                    // COUNT looks at every matching row and then gives
-                    // one row back. A LIMIT applies to that one row, not
-                    // to the counting, so it can only hide the answer.
-                    What::Count => {
-                        let mut count = 0usize;
-                        visit(t, filter, params, |_, _| { count += 1; Ok(true) })?;
-                        let rows = if limit == &Some(0) {
-                            Vec::new()
-                        } else {
-                            vec![vec![Value::Int(count as i64)]]
-                        };
-                        Ok(Outcome::Rows(rows))
-                    }
-                    What::Row(picks) => {
-                        let limit = limit.unwrap_or(usize::MAX);
-                        let mut out = Vec::new();
-                        visit(t, filter, params, |key, row| {
-                            if out.len() >= limit { return Ok(false); }
-                            out.push(picks.iter().map(|p| take(*p, key, row)).collect());
-                            Ok(out.len() < limit)
-                        })?;
-                        Ok(Outcome::Rows(out))
-                    }
+        let Plan::Select { table, join, what, filter, order, limit } = &self.plan else {
+            return Err(err("this statement changes things; use run"));
+        };
+        // `COUNT(*)` with nothing else to check never needs the rows
+        // themselves. The table knows how many it holds, and an index
+        // knows how many hold a given value. Fetching each row to add
+        // one to a counter was eight times slower than SQLite here.
+        if let What::Aggs(aggs) = what {
+            if join.is_none()
+                && filter.tests.is_empty()
+                && aggs.iter().all(|a| a.func == Func::Count && a.arg.is_none())
+            {
+                if let Some(n) = counted_without_rows(db, *table, filter, params)? {
+                    if limit == &Some(0) { return Ok(Outcome::Rows(Vec::new())); }
+                    return Ok(Outcome::Rows(vec![vec![Value::Int(n); aggs.len()]]));
                 }
             }
-            _ => Err(err("this statement changes things; use run")),
+        }
+        match what {
+            What::Aggs(aggs) => {
+                let mut state: Vec<AggState> =
+                    aggs.iter().map(|a| AggState::new(a.func, a.arg.is_none())).collect();
+                visit(db, *table, join, filter, params, &mut |sides| {
+                    for (s, a) in state.iter_mut().zip(aggs) {
+                        match a.arg {
+                            None => s.saw_row(),
+                            Some(p) => s.saw(&take(p, sides)),
+                        }
+                    }
+                    Ok(true)
+                })?;
+                // An aggregate gives one row back, and a LIMIT can only
+                // hide it, never cut the counting short.
+                if limit == &Some(0) {
+                    return Ok(Outcome::Rows(Vec::new()));
+                }
+                Ok(Outcome::Rows(vec![state.iter().map(AggState::finish).collect()]))
+            }
+            What::Row(picks) => {
+                let cap = limit.unwrap_or(usize::MAX);
+                if order.is_empty() {
+                    let mut out = Vec::new();
+                    visit(db, *table, join, filter, params, &mut |sides| {
+                        out.push(picks.iter().map(|p| take(*p, sides)).collect());
+                        Ok(out.len() < cap)
+                    })?;
+                    out.truncate(cap);
+                    return Ok(Outcome::Rows(out));
+                }
+                // With an ORDER BY, every matching row has to be found
+                // before any of them can be left out, so the LIMIT waits
+                // until the sorting is done.
+                let mut rows: Vec<(Vec<SortKey>, Row)> = Vec::new();
+                visit(db, *table, join, filter, params, &mut |sides| {
+                    let keys = order.iter().map(|s| SortKey(take(s.pick, sides))).collect();
+                    rows.push((keys, picks.iter().map(|p| take(*p, sides)).collect()));
+                    Ok(true)
+                })?;
+                rows.sort_by(|a, b| {
+                    for (i, s) in order.iter().enumerate() {
+                        let got = a.0[i].cmp(&b.0[i]);
+                        let got = if s.desc { got.reverse() } else { got };
+                        if got != Ordering::Equal {
+                            return got;
+                        }
+                    }
+                    Ordering::Equal
+                });
+                rows.truncate(cap);
+                Ok(Outcome::Rows(rows.into_iter().map(|(_, r)| r).collect()))
+            }
         }
     }
 
@@ -419,10 +687,36 @@ impl Statement {
                 Ok(Outcome::Done)
             }
 
+            Plan::CreateIndex { name, table, column, if_missing } => {
+                if *if_missing && db.index_id(name).is_ok() {
+                    return Ok(Outcome::Done);
+                }
+                let id = db.table_id(table)?;
+                let col = db
+                    .table(id)
+                    .column_of(column)
+                    .ok_or_else(|| err(&format!("{table} has no column called {column}")))?;
+                db.create_index(name, id, col)?;
+                Ok(Outcome::Done)
+            }
+
+            Plan::DropIndex { name, if_there } => {
+                if *if_there && db.index_id(name).is_err() {
+                    return Ok(Outcome::Done);
+                }
+                db.drop_index(name)?;
+                Ok(Outcome::Done)
+            }
+
             Plan::Insert { table, key, values } => {
                 let key = match value_of(key, params)? {
                     Value::Int(i) => *i,
-                    other => return Err(err(&format!("a key has to be an integer, not {}", other.type_name()))),
+                    other => {
+                        return Err(err(&format!(
+                            "a key has to be an integer, not {}",
+                            other.type_name()
+                        )))
+                    }
                 };
                 let row: Row = values
                     .iter()
@@ -456,10 +750,16 @@ impl Statement {
     }
 
     /// The keys a change applies to, gathered before anything moves.
-    fn matching(&self, db: &Db, table: TableId, filter: &Where, params: &[Value]) -> Result<Vec<i64>> {
+    fn matching(
+        &self,
+        db: &Db,
+        table: TableId,
+        filter: &Where,
+        params: &[Value],
+    ) -> Result<Vec<i64>> {
         let mut keys = Vec::new();
-        visit(db.table(table), filter, params, |key, _| {
-            keys.push(key);
+        visit(db, table, &None, filter, params, &mut |sides| {
+            keys.push(sides[0].0);
             Ok(true)
         })?;
         Ok(keys)
@@ -477,42 +777,168 @@ impl Statement {
     }
 }
 
-fn value_of<'a>(e: &'a Expr, params: &'a [Value]) -> Result<&'a Value> {
-    match e {
-        Expr::Lit(v) => Ok(v),
-        Expr::Param(n) => params.get(*n).ok_or_else(|| err("a value is missing")),
-    }
-}
-
-fn take(pick: Pick, key: i64, row: &Row) -> Value {
-    match pick {
-        Pick::Key => Value::Int(key),
-        Pick::Col(i) => row[i].clone(),
-    }
-}
-
-fn passes(tests: &[Test], key: i64, row: &Row, params: &[Value]) -> Result<bool> {
-    for t in tests {
-        let left = match t.pick {
-            Pick::Key => Value::Int(key),
-            Pick::Col(i) => row[i].clone(),
-        };
-        let right = value_of(&t.value, params)?;
-        match order(&left, right) {
-            Some(o) if t.cmp.holds(o) => {}
-            _ => return Ok(false),
-        }
-    }
-    Ok(true)
-}
-
-/// Walk the rows a WHERE picks out, stopping when `each` says to.
-fn visit(
-    t: &crate::Table,
+/// How many rows a WHERE picks out, when that can be answered without
+/// looking at any of them. None means it has to be walked after all.
+fn counted_without_rows(
+    db: &Db,
+    table: TableId,
     filter: &Where,
     params: &[Value],
-    mut each: impl FnMut(i64, &Row) -> Result<bool>,
+) -> Result<Option<i64>> {
+    Ok(Some(match &filter.find {
+        Find::All => db.table(table).len() as i64,
+        Find::Key(e) => match value_of(e, params)? {
+            Value::Int(k) => db.table(table).get(*k).is_some() as i64,
+            _ => 0,
+        },
+        Find::Index { index, value } => {
+            let v = value_of(value, params)?;
+            if *v == Value::Null {
+                0
+            } else {
+                db.index(*index).keys_for(v).map_or(0, |k| k.len()) as i64
+            }
+        }
+        // A range of keys has to be walked; a B-tree cannot say how many
+        // lie between two points without stepping over them.
+        Find::Range { .. } => return Ok(None),
+    }))
+}
+
+// ── Aggregates ─────────────────────────────────────────────────────────
+
+/// What one COUNT, SUM, MIN or MAX has seen so far.
+struct AggState {
+    func: Func,
+    /// True for `COUNT(*)`, which counts rows rather than values.
+    star: bool,
+    rows: i64,
+    /// Values that were not null, which is what COUNT of a column counts.
+    seen: i64,
+    /// A running total while every value has been a whole number.
+    whole: Option<i64>,
+    /// The total once a real has turned up, or the whole one grew too big.
+    real: f64,
+    best: Option<Value>,
+}
+
+impl AggState {
+    fn new(func: Func, star: bool) -> AggState {
+        AggState { func, star, rows: 0, seen: 0, whole: Some(0), real: 0.0, best: None }
+    }
+
+    fn saw_row(&mut self) { self.rows += 1; }
+
+    fn saw(&mut self, v: &Value) {
+        self.rows += 1;
+        if *v == Value::Null { return; }
+        self.seen += 1;
+        match self.func {
+            Func::Sum => match v {
+                Value::Int(i) => {
+                    self.real += *i as f64;
+                    self.whole = self.whole.and_then(|w| w.checked_add(*i));
+                }
+                Value::Real(r) => {
+                    self.real += r;
+                    self.whole = None;
+                }
+                // SQLite adds up only what looks like a number.
+                _ => {}
+            },
+            Func::Min | Func::Max => {
+                let better = match &self.best {
+                    None => true,
+                    Some(b) => {
+                        let got = SortKey(v.clone()).cmp(&SortKey(b.clone()));
+                        if self.func == Func::Min {
+                            got == Ordering::Less
+                        } else {
+                            got == Ordering::Greater
+                        }
+                    }
+                };
+                if better { self.best = Some(v.clone()); }
+            }
+            Func::Count => {}
+        }
+    }
+
+    fn finish(&self) -> Value {
+        match self.func {
+            Func::Count => Value::Int(if self.star { self.rows } else { self.seen }),
+            // A sum over nothing is nothing, not zero. A zero would be a
+            // claim about data that is not there, and SQLite says so too.
+            Func::Sum => {
+                if self.seen == 0 { return Value::Null; }
+                match self.whole {
+                    Some(w) => Value::Int(w),
+                    None => Value::Real(self.real),
+                }
+            }
+            Func::Min | Func::Max => self.best.clone().unwrap_or(Value::Null),
+        }
+    }
+}
+
+// ── Walking the rows ───────────────────────────────────────────────────
+
+/// Walk the rows a query picks out, stopping when `each` says to.
+fn visit(
+    db: &Db,
+    table: TableId,
+    join: &Option<Joined>,
+    filter: &Where,
+    params: &[Value],
+    each: &mut dyn FnMut(&Sides) -> Result<bool>,
 ) -> Result<()> {
+    let t = db.table(table);
+    let mut go = |key: i64, row: &Row| -> Result<bool> {
+        let one = [(key, row)];
+        if !passes(&filter.tests, &one, params)? {
+            return Ok(true);
+        }
+        let Some(j) = join else { return each(&one) };
+        let value = take(j.left, &one);
+        if value == Value::Null {
+            // Null matches nothing, not even another null.
+            return Ok(true);
+        }
+        let right = db.table(j.table);
+        match &j.by {
+            JoinBy::Key => {
+                let Value::Int(k) = value else { return Ok(true) };
+                let Some(r) = right.get(k) else { return Ok(true) };
+                let both = [(key, row), (k, r)];
+                if passes(&filter.after_join, &both, params)? {
+                    return each(&both);
+                }
+                Ok(true)
+            }
+            JoinBy::Index(index) => {
+                let Some(keys) = db.index(*index).keys_for(&value) else { return Ok(true) };
+                for k in keys {
+                    let Some(r) = right.get(*k) else { continue };
+                    let both = [(key, row), (*k, r)];
+                    if passes(&filter.after_join, &both, params)? && !each(&both)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+            JoinBy::Scan(col) => {
+                for (k, r) in right.iter() {
+                    if r.get(*col) != Some(&value) { continue; }
+                    let both = [(key, row), (k, r)];
+                    if passes(&filter.after_join, &both, params)? && !each(&both)? {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+        }
+    };
+
     match &filter.find {
         Find::Key(e) => {
             let key = match value_of(e, params)? {
@@ -520,8 +946,16 @@ fn visit(
                 _ => return Ok(()),
             };
             if let Some(row) = t.get(key) {
-                if passes(&filter.tests, key, row, params)? {
-                    each(key, row)?;
+                go(key, row)?;
+            }
+        }
+        Find::Index { index, value } => {
+            let value = value_of(value, params)?;
+            if *value == Value::Null { return Ok(()); }
+            if let Some(keys) = db.index(*index).keys_for(value) {
+                for key in keys {
+                    let Some(row) = t.get(*key) else { continue };
+                    if !go(*key, row)? { break; }
                 }
             }
         }
@@ -549,22 +983,17 @@ fn visit(
                 None => i64::MAX,
             };
             for (key, row) in t.range(from, to) {
-                if passes(&filter.tests, key, row, params)? && !each(key, row)? {
-                    break;
-                }
+                if !go(key, row)? { break; }
             }
         }
         Find::All => {
             for (key, row) in t.iter() {
-                if passes(&filter.tests, key, row, params)? && !each(key, row)? {
-                    break;
-                }
+                if !go(key, row)? { break; }
             }
         }
     }
     Ok(())
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -767,6 +1196,233 @@ mod tests {
         assert!(db.prepare("UPDATE kv SET id = 1").is_err());
         assert!(db.prepare("INSERT INTO kv (nope) VALUES (1)").is_err());
         assert!(db.prepare("INSERT INTO kv (a) VALUES (1)").is_err());
+    }
+
+    // ── Phase 4 ────────────────────────────────────────────────────────
+
+    #[test]
+    fn order_by_sorts_both_ways_and_on_several_columns() {
+        let mut db = kv();
+        db.execute("UPDATE kv SET a = 0 WHERE id = 3", &[]).unwrap();
+        let got: Vec<i64> = db
+            .query("SELECT id FROM kv ORDER BY a DESC", &[])
+            .unwrap()
+            .rows()
+            .iter()
+            .map(|r| r[0].as_int().unwrap())
+            .collect();
+        // Rows 0 and 3 both hold zero. The sort is stable, so they keep
+        // the order they were found in. SQL promises nothing about ties.
+        assert_eq!(got, vec![9, 8, 7, 6, 5, 4, 2, 1, 0, 3]);
+        let got: Vec<i64> = db
+            .query("SELECT id FROM kv ORDER BY a, id DESC LIMIT 3", &[])
+            .unwrap()
+            .rows()
+            .iter()
+            .map(|r| r[0].as_int().unwrap())
+            .collect();
+        assert_eq!(got, vec![3, 0, 1]);
+    }
+
+    #[test]
+    fn a_limit_after_an_order_by_takes_the_first_rows_of_the_sorted_lot() {
+        let db = kv();
+        let got: Vec<i64> = db
+            .query("SELECT id FROM kv ORDER BY id DESC LIMIT 2", &[])
+            .unwrap()
+            .rows()
+            .iter()
+            .map(|r| r[0].as_int().unwrap())
+            .collect();
+        assert_eq!(got, vec![9, 8]);
+    }
+
+    #[test]
+    fn nulls_sort_first() {
+        let mut db = Db::new();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER)", &[]).unwrap();
+        for (k, v) in [(1, "5"), (2, "NULL"), (3, "1")] {
+            db.execute(&format!("INSERT INTO t (id, a) VALUES ({k}, {v})"), &[]).unwrap();
+        }
+        let got: Vec<i64> = db
+            .query("SELECT id FROM t ORDER BY a", &[])
+            .unwrap()
+            .rows()
+            .iter()
+            .map(|r| r[0].as_int().unwrap())
+            .collect();
+        assert_eq!(got, vec![2, 3, 1]);
+    }
+
+    #[test]
+    fn the_four_aggregates_answer_the_way_sqlite_does() {
+        let mut db = Db::new();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a INTEGER, b REAL)", &[]).unwrap();
+        // Nothing in it yet.
+        let out = db.query("SELECT COUNT(*), SUM(a), MIN(a), MAX(a) FROM t", &[]).unwrap();
+        assert_eq!(
+            out.rows()[0],
+            vec![Value::Int(0), Value::Null, Value::Null, Value::Null]
+        );
+        for (k, a) in [(1, "3"), (2, "NULL"), (3, "-5"), (4, "10")] {
+            db.execute(&format!("INSERT INTO t (id, a, b) VALUES ({k}, {a}, 1.5)"), &[]).unwrap();
+        }
+        let out = db
+            .query("SELECT COUNT(*), COUNT(a), SUM(a), MIN(a), MAX(a) FROM t", &[])
+            .unwrap();
+        assert_eq!(
+            out.rows()[0],
+            vec![Value::Int(4), Value::Int(3), Value::Int(8), Value::Int(-5), Value::Int(10)]
+        );
+        // A real anywhere in the sum makes the answer a real.
+        let out = db.query("SELECT SUM(b) FROM t", &[]).unwrap();
+        assert_eq!(out.rows()[0], vec![Value::Real(6.0)]);
+        // All null is the same as nothing, for a sum.
+        let out = db.query("SELECT SUM(a) FROM t WHERE id = 2", &[]).unwrap();
+        assert_eq!(out.rows()[0], vec![Value::Null]);
+    }
+
+    #[test]
+    fn an_index_gives_the_same_answers_as_a_walk() {
+        let mut db = kv();
+        db.execute("UPDATE kv SET a = 50 WHERE id = 7", &[]).unwrap();
+        let without: Vec<i64> = db
+            .query("SELECT id FROM kv WHERE a = 50 ORDER BY id", &[])
+            .unwrap()
+            .rows()
+            .iter()
+            .map(|r| r[0].as_int().unwrap())
+            .collect();
+        assert_eq!(without, vec![5, 7]);
+        db.execute("CREATE INDEX kv_a ON kv (a)", &[]).unwrap();
+        let with: Vec<i64> = db
+            .query("SELECT id FROM kv WHERE a = 50 ORDER BY id", &[])
+            .unwrap()
+            .rows()
+            .iter()
+            .map(|r| r[0].as_int().unwrap())
+            .collect();
+        assert_eq!(with, without);
+    }
+
+    #[test]
+    fn an_index_keeps_up_with_changes() {
+        let mut db = kv();
+        db.execute("CREATE INDEX kv_a ON kv (a)", &[]).unwrap();
+        let ids = |db: &Db, v: i64| -> Vec<i64> {
+            db.query(&format!("SELECT id FROM kv WHERE a = {v} ORDER BY id"), &[])
+                .unwrap()
+                .rows()
+                .iter()
+                .map(|r| r[0].as_int().unwrap())
+                .collect()
+        };
+        assert_eq!(ids(&db, 30), vec![3]);
+        db.execute("UPDATE kv SET a = 30 WHERE id = 8", &[]).unwrap();
+        assert_eq!(ids(&db, 30), vec![3, 8]);
+        db.execute("DELETE FROM kv WHERE id = 3", &[]).unwrap();
+        assert_eq!(ids(&db, 30), vec![8]);
+        db.execute("INSERT INTO kv (id, a) VALUES (99, 30)", &[]).unwrap();
+        assert_eq!(ids(&db, 30), vec![8, 99]);
+        db.execute("DROP INDEX kv_a", &[]).unwrap();
+        assert_eq!(ids(&db, 30), vec![8, 99]);
+    }
+
+    #[test]
+    fn an_index_is_refused_twice_and_missed_once() {
+        let mut db = kv();
+        db.execute("CREATE INDEX kv_a ON kv (a)", &[]).unwrap();
+        assert!(db.execute("CREATE INDEX kv_a ON kv (a)", &[]).is_err());
+        db.execute("CREATE INDEX IF NOT EXISTS kv_a ON kv (a)", &[]).unwrap();
+        assert!(db.prepare("CREATE INDEX kv_z ON kv (nope)").is_err());
+        assert!(db.prepare("CREATE INDEX kv_z ON nope (a)").is_err());
+        db.execute("DROP INDEX kv_a", &[]).unwrap();
+        assert!(db.execute("DROP INDEX kv_a", &[]).is_err());
+        db.execute("DROP INDEX IF EXISTS kv_a", &[]).unwrap();
+    }
+
+    /// Two tables: orders pointing at customers.
+    fn two() -> Db {
+        let mut db = Db::new();
+        db.execute("CREATE TABLE cust (id INTEGER PRIMARY KEY, name TEXT)", &[]).unwrap();
+        db.execute("CREATE TABLE ord (id INTEGER PRIMARY KEY, who INTEGER, amount INTEGER)", &[])
+            .unwrap();
+        for (id, name) in [(1, "alice"), (2, "bob"), (3, "carol")] {
+            db.execute(&format!("INSERT INTO cust (id, name) VALUES ({id}, '{name}')"), &[])
+                .unwrap();
+        }
+        for (id, who, amount) in [(10, 1, 5), (11, 1, 7), (12, 2, 9), (13, 9, 1)] {
+            db.execute(
+                &format!("INSERT INTO ord (id, who, amount) VALUES ({id}, {who}, {amount})"),
+                &[],
+            )
+            .unwrap();
+        }
+        db
+    }
+
+    #[test]
+    fn a_join_through_a_key_matches_and_drops_the_rest() {
+        let db = two();
+        let out = db
+            .query("SELECT ord.id, cust.name FROM ord JOIN cust ON ord.who = cust.id ORDER BY ord.id", &[])
+            .unwrap();
+        assert_eq!(out.rows().len(), 3, "the order pointing at nobody is left out");
+        assert_eq!(out.rows()[0], vec![Value::Int(10), Value::Text("alice".into())]);
+        assert_eq!(out.rows()[2], vec![Value::Int(12), Value::Text("bob".into())]);
+    }
+
+    #[test]
+    fn a_join_reads_the_same_whichever_way_the_on_is_written() {
+        let db = two();
+        let a = db.query("SELECT ord.id FROM ord JOIN cust ON ord.who = cust.id", &[]).unwrap();
+        let b = db.query("SELECT ord.id FROM ord JOIN cust ON cust.id = ord.who", &[]).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn a_join_can_be_filtered_on_either_side() {
+        let db = two();
+        let out = db
+            .query("SELECT ord.id FROM ord JOIN cust ON ord.who = cust.id WHERE cust.name = 'alice'", &[])
+            .unwrap();
+        let ids: Vec<i64> = out.rows().iter().map(|r| r[0].as_int().unwrap()).collect();
+        assert_eq!(ids, vec![10, 11]);
+        let out = db
+            .query("SELECT cust.name FROM ord JOIN cust ON ord.who = cust.id WHERE ord.amount > 6", &[])
+            .unwrap();
+        assert_eq!(out.rows().len(), 2);
+    }
+
+    #[test]
+    fn a_join_onto_a_plain_column_works_with_and_without_an_index() {
+        let mut db = two();
+        let ask = "SELECT ord.id FROM cust JOIN ord ON cust.id = ord.who ORDER BY ord.id";
+        let without: Vec<i64> =
+            db.query(ask, &[]).unwrap().rows().iter().map(|r| r[0].as_int().unwrap()).collect();
+        assert_eq!(without, vec![10, 11, 12]);
+        db.execute("CREATE INDEX ord_who ON ord (who)", &[]).unwrap();
+        let with: Vec<i64> =
+            db.query(ask, &[]).unwrap().rows().iter().map(|r| r[0].as_int().unwrap()).collect();
+        assert_eq!(with, without);
+    }
+
+    #[test]
+    fn a_join_counts_and_sums_over_the_pairs() {
+        let db = two();
+        let out = db
+            .query("SELECT COUNT(*), SUM(ord.amount) FROM ord JOIN cust ON ord.who = cust.id", &[])
+            .unwrap();
+        assert_eq!(out.rows()[0], vec![Value::Int(3), Value::Int(21)]);
+    }
+
+    #[test]
+    fn a_name_in_both_tables_has_to_say_which() {
+        let db = two();
+        assert!(db.prepare("SELECT id FROM ord JOIN cust ON ord.who = cust.id").is_err());
+        assert!(db.prepare("SELECT ord.id FROM ord JOIN cust ON ord.who = cust.id").is_ok());
+        assert!(db.prepare("SELECT amount FROM ord JOIN cust ON ord.who = cust.id").is_ok());
+        assert!(db.prepare("SELECT nope.id FROM ord JOIN cust ON ord.who = cust.id").is_err());
     }
 
     #[test]

@@ -33,7 +33,7 @@ pub mod sql;
 pub use log::Durability;
 pub use plan::{Outcome, Statement};
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::Path;
 
 use log::{Change, Store};
@@ -106,6 +106,52 @@ impl Value {
     }
 }
 
+/// A value wrapped so that it can be sorted and used as a key.
+///
+/// [`Value`] on its own has no total order: a real can be NaN, and null
+/// compares to nothing at all. That is right inside a WHERE, where
+/// anything against null is false. It is wrong for ORDER BY and for an
+/// index, which have to put every value somewhere. Here null comes
+/// first, then numbers, then text, then blobs, which is the order SQLite
+/// uses.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SortKey(pub Value);
+
+impl Eq for SortKey {}
+
+impl SortKey {
+    fn rank(&self) -> u8 {
+        match self.0 {
+            Value::Null => 0,
+            Value::Int(_) | Value::Real(_) => 1,
+            Value::Text(_) => 2,
+            Value::Blob(_) => 3,
+        }
+    }
+}
+
+impl Ord for SortKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use std::cmp::Ordering;
+        match (&self.0, &other.0) {
+            (Value::Int(a), Value::Int(b)) => a.cmp(b),
+            (Value::Real(a), Value::Real(b)) => a.total_cmp(b),
+            (Value::Int(a), Value::Real(b)) => (*a as f64).total_cmp(b),
+            (Value::Real(a), Value::Int(b)) => a.total_cmp(&(*b as f64)),
+            (Value::Text(a), Value::Text(b)) => a.cmp(b),
+            (Value::Blob(a), Value::Blob(b)) => a.cmp(b),
+            _ => match self.rank().cmp(&other.rank()) {
+                Ordering::Equal => Ordering::Equal,
+                other => other,
+            },
+        }
+    }
+}
+
+impl PartialOrd for SortKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> { Some(self.cmp(other)) }
+}
+
 // ── What can go wrong ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -130,6 +176,10 @@ pub enum Error {
     Sql(String),
     /// Something went wrong with the files on disk.
     Disk(String),
+    /// An index by that name is already here.
+    IndexExists(String),
+    /// No index by that name.
+    NoIndex(String),
 }
 
 impl std::fmt::Display for Error {
@@ -149,6 +199,8 @@ impl std::fmt::Display for Error {
             Error::NotNull(c) => write!(f, "column {c} cannot be empty"),
             Error::Sql(s) => write!(f, "{s}"),
             Error::Disk(s) => write!(f, "the database files: {s}"),
+            Error::IndexExists(n) => write!(f, "there is already an index called {n}"),
+            Error::NoIndex(n) => write!(f, "there is no index called {n}"),
         }
     }
 }
@@ -187,6 +239,9 @@ pub struct Table {
     key: String,
     columns: Vec<Column>,
     rows: BTreeMap<i64, Row>,
+    /// Which indexes have to be kept up as rows change. Empty is the
+    /// usual case, and one test of that keeps the cost off the hot path.
+    watchers: Vec<usize>,
 }
 
 impl Table {
@@ -313,6 +368,49 @@ impl Table {
     }
 }
 
+/// Which index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IndexId(usize);
+
+/// One column of one table, with the keys of every row that holds each
+/// value. Several rows can share a value, so each entry holds a set.
+#[derive(Debug, Clone)]
+pub struct Index {
+    name: String,
+    table: TableId,
+    column: usize,
+    entries: BTreeMap<SortKey, BTreeSet<i64>>,
+    dropped: bool,
+}
+
+impl Index {
+    pub fn name(&self) -> &str { &self.name }
+    pub fn table(&self) -> TableId { self.table }
+    pub fn column(&self) -> usize { self.column }
+
+    /// The keys of the rows whose value in this column is `value`.
+    pub fn keys_for(&self, value: &Value) -> Option<&BTreeSet<i64>> {
+        self.entries.get(&SortKey(value.clone()))
+    }
+
+    /// Every value in order, with the rows holding it.
+    pub fn iter(&self) -> impl Iterator<Item = (&Value, &BTreeSet<i64>)> {
+        self.entries.iter().map(|(k, v)| (&k.0, v))
+    }
+
+    fn add(&mut self, value: &Value, key: i64) {
+        self.entries.entry(SortKey(value.clone())).or_default().insert(key);
+    }
+
+    fn remove(&mut self, value: &Value, key: i64) {
+        let k = SortKey(value.clone());
+        if let Some(set) = self.entries.get_mut(&k) {
+            set.remove(&key);
+            if set.is_empty() { self.entries.remove(&k); }
+        }
+    }
+}
+
 // ── The database ───────────────────────────────────────────────────────
 
 /// Which table. Handing one of these back and taking it again means a
@@ -336,6 +434,8 @@ pub struct Db {
     /// The files, when this database has any. Without them it is a
     /// database in memory that forgets everything when the program ends.
     store: Option<Store>,
+    indexes: Vec<Index>,
+    index_names: HashMap<String, usize>,
     /// The commit being built, as the bytes that will go to the log.
     /// Keeping bytes rather than a list of changes means a row never has
     /// to be copied on its way to the disk.
@@ -376,6 +476,7 @@ impl Db {
             key: key.to_string(),
             columns,
             rows: BTreeMap::new(),
+            watchers: Vec::new(),
         });
         self.by_name.insert(name.to_string(), id.0);
         let columns = self.tables[id.0].columns.clone();
@@ -408,6 +509,11 @@ impl Db {
     // ── SQL ────────────────────────────────────────────────────────────
 
     /// Read and plan a statement, ready to run many times.
+    ///
+    /// The plan is settled here, including which index to use. A
+    /// statement prepared before an index was made still answers
+    /// correctly, and still walks the table. Prepare it again to pick
+    /// the index up.
     pub fn prepare(&self, sql: &str) -> Result<Statement> { plan::plan(self, sql) }
 
     /// Read, plan and run a statement that only reads. It takes the
@@ -484,6 +590,96 @@ impl Db {
         self.record(Change::DropTable { name: name.to_string() })
     }
 
+    // ── Indexes ────────────────────────────────────────────────────────
+
+    /// Make an index on one column, and fill it from the rows already
+    /// there.
+    pub fn create_index(&mut self, name: &str, table: TableId, column: usize) -> Result<IndexId> {
+        if self.index_names.contains_key(name) {
+            return Err(Error::IndexExists(name.to_string()));
+        }
+        if column >= self.tables[table.0].columns.len() {
+            return Err(Error::NoColumn(column));
+        }
+        let slot = self.indexes.len();
+        self.indexes.push(Index {
+            name: name.to_string(),
+            table,
+            column,
+            entries: BTreeMap::new(),
+            dropped: false,
+        });
+        self.index_names.insert(name.to_string(), slot);
+        self.tables[table.0].watchers.push(slot);
+        self.fill_index(slot);
+        let column = self.tables[table.0].columns[column].name.clone();
+        self.record(Change::NewIndex { name: name.to_string(), table: table.0 as u32, column })?;
+        Ok(IndexId(slot))
+    }
+
+    pub fn index_id(&self, name: &str) -> Result<IndexId> {
+        self.index_names.get(name).map(|i| IndexId(*i)).ok_or_else(|| Error::NoIndex(name.to_string()))
+    }
+
+    pub fn index(&self, id: IndexId) -> &Index { &self.indexes[id.0] }
+
+    /// An index on this column of this table, if there is one.
+    pub fn index_on(&self, table: TableId, column: usize) -> Option<IndexId> {
+        self.tables[table.0]
+            .watchers
+            .iter()
+            .find(|&&s| !self.indexes[s].dropped && self.indexes[s].column == column)
+            .map(|&s| IndexId(s))
+    }
+
+    pub fn drop_index(&mut self, name: &str) -> Result<()> {
+        let slot = *self.index_names.get(name).ok_or_else(|| Error::NoIndex(name.to_string()))?;
+        self.indexes[slot].entries.clear();
+        self.indexes[slot].dropped = true;
+        let table = self.indexes[slot].table;
+        self.tables[table.0].watchers.retain(|&s| s != slot);
+        self.index_names.remove(name);
+        self.record(Change::DropIndex { name: name.to_string() })
+    }
+
+    fn fill_index(&mut self, slot: usize) {
+        let table = self.indexes[slot].table;
+        let column = self.indexes[slot].column;
+        let pairs: Vec<(i64, Value)> = self.tables[table.0]
+            .rows
+            .iter()
+            .filter_map(|(k, row)| row.get(column).map(|v| (*k, v.clone())))
+            .collect();
+        for (key, value) in pairs {
+            self.indexes[slot].add(&value, key);
+        }
+    }
+
+    /// Put a row into every index watching its table.
+    fn index_add(&mut self, table: TableId, key: i64, row: &Row) {
+        if self.tables[table.0].watchers.is_empty() { return; }
+        for slot in self.tables[table.0].watchers.clone() {
+            if let Some(v) = row.get(self.indexes[slot].column) {
+                let v = v.clone();
+                self.indexes[slot].add(&v, key);
+            }
+        }
+    }
+
+    /// Take a row out of every index watching its table.
+    fn index_take(&mut self, table: TableId, key: i64, row: &Row) {
+        if self.tables[table.0].watchers.is_empty() { return; }
+        for slot in self.tables[table.0].watchers.clone() {
+            if let Some(v) = row.get(self.indexes[slot].column) {
+                let v = v.clone();
+                self.indexes[slot].remove(&v, key);
+            }
+        }
+    }
+
+    #[inline]
+    fn watched(&self, table: TableId) -> bool { !self.tables[table.0].watchers.is_empty() }
+
     // ── Changing rows ──────────────────────────────────────────────────
     //
     // Every change goes through here, so that the log hears about all of
@@ -539,6 +735,10 @@ impl Db {
             self.tables[table.0].insert(key, row)?;
         }
         self.note_insert(table, key);
+        if self.watched(table) {
+            let row = self.tables[table.0].rows[&key].clone();
+            self.index_add(table, key, &row);
+        }
         self.close_if_alone()
     }
 
@@ -550,7 +750,17 @@ impl Db {
             log::put_row(self.opening(), t, key, &row);
         }
         self.note_change(table, key);
+        let watched = self.watched(table);
+        if watched {
+            if let Some(old) = self.tables[table.0].get(key).cloned() {
+                self.index_take(table, key, &old);
+            }
+        }
         let old = self.tables[table.0].put(key, row)?;
+        if watched {
+            let now = self.tables[table.0].rows[&key].clone();
+            self.index_add(table, key, &now);
+        }
         self.close_if_alone()?;
         Ok(old)
     }
@@ -563,7 +773,18 @@ impl Db {
             log::put_set(self.opening(), t, key, column as u32, &value);
         }
         self.note_change(table, key);
+        let watched = self.watched(table);
+        let was = if watched { self.tables[table.0].get_at(key, column).cloned() } else { None };
         self.tables[table.0].update(key, column, value)?;
+        if watched {
+            let slots = self.tables[table.0].watchers.clone();
+            let now = self.tables[table.0].get_at(key, column).cloned();
+            for slot in slots {
+                if self.indexes[slot].column != column { continue; }
+                if let Some(v) = &was { self.indexes[slot].remove(v, key); }
+                if let Some(v) = &now { self.indexes[slot].add(v, key); }
+            }
+        }
         self.close_if_alone()
     }
 
@@ -575,6 +796,11 @@ impl Db {
             log::put_delete(self.opening(), t, key);
         }
         self.note_change(table, key);
+        if self.watched(table) {
+            if let Some(old) = self.tables[table.0].get(key).cloned() {
+                self.index_take(table, key, &old);
+            }
+        }
         self.tables[table.0].delete(key);
         self.close_if_alone()?;
         Ok(true)
@@ -598,6 +824,11 @@ impl Db {
         let mut db = Db::new();
         for commit in commits {
             db.replay(commit)?;
+        }
+        // The indexes were only definitions on the way in. Now that
+        // every row is back, fill them.
+        for slot in 0..db.indexes.len() {
+            if !db.indexes[slot].dropped { db.fill_index(slot); }
         }
         db.store = Some(store);
         Ok(db)
@@ -667,6 +898,14 @@ impl Db {
                 out.push(Change::Put { table: i as u32, key: *key, row: row.clone() });
             }
         }
+        for index in &self.indexes {
+            if index.dropped { continue; }
+            out.push(Change::NewIndex {
+                name: index.name.clone(),
+                table: index.table.0 as u32,
+                column: self.tables[index.table.0].columns[index.column].name.clone(),
+            });
+        }
         out
     }
 
@@ -700,6 +939,31 @@ impl Db {
                     let t = self.tables.get_mut(table as usize)
                         .ok_or_else(|| Error::Disk(format!("the log names table {table}, which is not there")))?;
                     t.rows.remove(&key);
+                }
+                Change::NewIndex { name, table, column } => {
+                    let t = self.tables.get(table as usize)
+                        .ok_or_else(|| Error::Disk(format!("the log names table {table}, which is not there")))?;
+                    let col = t.column_of(&column)
+                        .ok_or_else(|| Error::Disk(format!("the log names column {column}, which is not there")))?;
+                    // Filled in once the replay is over, because the rows
+                    // it covers may still be coming.
+                    let slot = self.indexes.len();
+                    self.indexes.push(Index {
+                        name: name.clone(),
+                        table: TableId(table as usize),
+                        column: col,
+                        entries: BTreeMap::new(),
+                        dropped: false,
+                    });
+                    self.index_names.insert(name, slot);
+                    self.tables[table as usize].watchers.push(slot);
+                }
+                Change::DropIndex { name } => {
+                    if let Some(slot) = self.index_names.remove(&name) {
+                        self.indexes[slot].dropped = true;
+                        let table = self.indexes[slot].table;
+                        self.tables[table.0].watchers.retain(|&s| s != slot);
+                    }
                 }
             }
         }
