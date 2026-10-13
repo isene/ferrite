@@ -157,6 +157,9 @@ pub enum Change {
     /// The key the table's next insert without one will get. Only a
     /// snapshot writes this: in the log, the inserts themselves say it.
     Next { table: u32, key: i64 },
+    /// One more column on the end of a table. Every row already there
+    /// gets the column's default in it.
+    AddColumn { table: u32, column: Column },
 }
 
 impl PartialEq for Column {
@@ -192,6 +195,18 @@ fn put_value(out: &mut Vec<u8>, v: &Value) {
     }
 }
 
+fn put_column(out: &mut Vec<u8>, col: &Column) {
+    put_str(out, &col.name);
+    out.push(match col.kind {
+        Kind::Int => 1,
+        Kind::Real => 2,
+        Kind::Text => 3,
+        Kind::Blob => 4,
+    });
+    out.push(col.null_ok as u8);
+    put_value(out, &col.default);
+}
+
 fn put_change(out: &mut Vec<u8>, c: &Change) {
     match c {
         Change::NewTable { name, key, columns, foreign_keys } => {
@@ -199,17 +214,7 @@ fn put_change(out: &mut Vec<u8>, c: &Change) {
             put_str(out, name);
             put_str(out, key);
             put_u32(out, columns.len() as u32);
-            for col in columns {
-                put_str(out, &col.name);
-                out.push(match col.kind {
-                    Kind::Int => 1,
-                    Kind::Real => 2,
-                    Kind::Text => 3,
-                    Kind::Blob => 4,
-                });
-                out.push(col.null_ok as u8);
-                put_value(out, &col.default);
-            }
+            for col in columns { put_column(out, col); }
             put_u32(out, foreign_keys.len() as u32);
             for fk in foreign_keys {
                 put_u32(out, fk.column as u32);
@@ -256,6 +261,11 @@ fn put_change(out: &mut Vec<u8>, c: &Change) {
             out.push(8);
             put_u32(out, *table);
             put_i64(out, *key);
+        }
+        Change::AddColumn { table, column } => {
+            out.push(9);
+            put_u32(out, *table);
+            put_column(out, column);
         }
     }
 }
@@ -359,6 +369,20 @@ impl<'a> Reader<'a> {
             _ => return None,
         })
     }
+    fn column(&mut self) -> Option<Column> {
+        let name = self.string()?;
+        let kind = match self.u8()? {
+            1 => Kind::Int,
+            2 => Kind::Real,
+            3 => Kind::Text,
+            4 => Kind::Blob,
+            _ => return None,
+        };
+        let null_ok = self.u8()? != 0;
+        let default = self.value()?;
+        Some(Column { name, kind, null_ok, default })
+    }
+
     fn change(&mut self) -> Option<Change> {
         Some(match self.u8()? {
             1 => {
@@ -366,19 +390,7 @@ impl<'a> Reader<'a> {
                 let key = self.string()?;
                 let n = self.u32()? as usize;
                 let mut columns = Vec::with_capacity(n);
-                for _ in 0..n {
-                    let cname = self.string()?;
-                    let kind = match self.u8()? {
-                        1 => Kind::Int,
-                        2 => Kind::Real,
-                        3 => Kind::Text,
-                        4 => Kind::Blob,
-                        _ => return None,
-                    };
-                    let null_ok = self.u8()? != 0;
-                    let default = self.value()?;
-                    columns.push(Column { name: cname, kind, null_ok, default });
-                }
+                for _ in 0..n { columns.push(self.column()?); }
                 let n = self.u32()? as usize;
                 let mut foreign_keys = Vec::with_capacity(n);
                 for _ in 0..n {
@@ -416,6 +428,7 @@ impl<'a> Reader<'a> {
             }
             7 => Change::DropIndex { name: self.string()? },
             8 => Change::Next { table: self.u32()?, key: self.i64()? },
+            9 => Change::AddColumn { table: self.u32()?, column: self.column()? },
             _ => return None,
         })
     }
@@ -677,6 +690,10 @@ mod tests {
             Change::NewIndex { name: "kv_ac".into(), table: 0, columns: vec!["a".into(), "c".into()], unique: true },
             Change::DropIndex { name: "kv_a".into() },
             Change::Next { table: 0, key: 10 },
+            Change::AddColumn {
+                table: 0,
+                column: Column { name: "n".into(), kind: Kind::Real, null_ok: true, default: Value::Real(0.5) },
+            },
         ]
     }
 

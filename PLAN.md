@@ -16,7 +16,8 @@ writes. It ships as one crate in the Fe2O3 suite, public domain.
 
 - No server and no network
 - No two processes sharing one file
-- No views, triggers, window functions or subqueries at first
+- No views, triggers or window functions
+- No query inside another that names the outer query's columns
 - No big-scan analytics
 
 ## Phase 0: the benchmark, before any engine code
@@ -61,6 +62,9 @@ writes. It ships as one crate in the Fe2O3 suite, public domain.
 
 - Secondary indexes, joins through an index, ORDER BY, LIMIT, COUNT,
   SUM, MIN and MAX.
+- Since 0.1.1: LIKE, IN, CASE, DISTINCT, GROUP BY, OFFSET, substr,
+  instr, json_extract, ALTER TABLE ADD COLUMN, and a query inside
+  another.
 - Same gate: every answer matches SQLite's.
 
 ## Phase 5: speed, one measured step at a time

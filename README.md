@@ -54,12 +54,21 @@ Nothing merges that is slower than what it replaces.
 
 CREATE TABLE with defaults, NOT NULL, UNIQUE, a primary key of any type
 or over several columns, and foreign keys with ON DELETE CASCADE.
-CREATE INDEX, unique or not, over one column or several. INSERT, also
-OR IGNORE and OR REPLACE. UPDATE, DELETE and transactions.
+CREATE INDEX, unique or not, over one column or several. ALTER TABLE
+ADD COLUMN. INSERT, also OR IGNORE and OR REPLACE. UPDATE, DELETE and
+transactions.
 
 SELECT with one inner join, table aliases, WHERE with AND, OR, NOT,
-IS NULL, BETWEEN, COALESCE and arithmetic, ORDER BY, LIMIT, COUNT, SUM,
-MIN and MAX. PRAGMA is read and ignored.
+IS NULL, BETWEEN, LIKE, IN, CASE, COALESCE and arithmetic. DISTINCT,
+GROUP BY, ORDER BY, LIMIT and OFFSET. COUNT, SUM, MIN and MAX. substr,
+instr and json_extract. PRAGMA is read and ignored.
+
+A query can sit inside another, as one value or behind IN, as long as
+it does not name the outer query's columns. It is answered first, and
+again each time the statement runs.
+
+Not there: outer joins, UNION, HAVING, views, triggers and window
+functions.
 
 Five types, kept as declared: a string in an INTEGER column is refused.
 Foreign keys are always checked; there is no switch to turn them off.

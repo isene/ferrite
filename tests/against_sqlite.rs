@@ -11,6 +11,11 @@
 //! INTEGER column and keeps it; ferrite refuses. So the generator only
 //! makes values that match the column they go in, and the test is about
 //! what queries mean rather than what types bend into.
+//!
+//! Where SQL leaves an answer open, the generator stays away. A plain
+//! column beside an aggregate, a DISTINCT sorted by something it does
+//! not show, a LIMIT with no total order: each engine may pick its own
+//! row there, and both are right.
 
 use ferrite::{Db, Value};
 use rusqlite::{types::ValueRef, Connection};
@@ -68,9 +73,93 @@ fn a_plain_condition(rng: &mut Rng) -> String {
     }
 }
 
+/// A few values in brackets, for IN. Sometimes none, sometimes a null
+/// among them, which leaves NOT IN unknown for every row.
+fn a_list(rng: &mut Rng, one: fn(&mut Rng) -> String) -> String {
+    let many = rng.below(5);
+    let values: Vec<String> = (0..many).map(|_| one(rng)).collect();
+    format!("({})", values.join(", "))
+}
+
+/// A query that gives one column back, to stand behind IN.
+fn a_column_query(rng: &mut Rng) -> (&'static str, String) {
+    match rng.below(6) {
+        0 => ("id", "SELECT ref FROM u".to_string()),
+        1 => ("id", format!("SELECT ref FROM u WHERE tag = {}", c_value(rng))),
+        2 => ("id", "SELECT ref FROM u WHERE ref IS NOT NULL AND id > (SELECT MIN(id) FROM u)".to_string()),
+        3 => ("a", "SELECT v FROM s".to_string()),
+        4 => ("c", "SELECT tag FROM u".to_string()),
+        _ => ("a", format!("SELECT a FROM t WHERE id < {}", rng.below(30))),
+    }
+}
+
+/// A query that gives one value back, with the column to hold it against.
+/// Each finds one row at most or adds rows up, so that neither engine
+/// has a first row to choose.
+fn a_value_query(rng: &mut Rng) -> (&'static str, String) {
+    match rng.below(7) {
+        0 => ("id", format!("(SELECT COALESCE(MAX(id), 0) FROM t) - {}", rng.below(12))),
+        1 => ("a", "(SELECT MIN(a) FROM t)".to_string()),
+        2 => ("a", "(SELECT COUNT(*) FROM u)".to_string()),
+        3 => ("id", format!("(SELECT ref FROM u WHERE id = {})", rng.below(30))),
+        4 => ("c", "(SELECT MAX(c) FROM t)".to_string()),
+        5 => ("b", "(SELECT MAX(b) FROM t)".to_string()),
+        _ => ("a", format!("(SELECT SUM(v) FROM s WHERE n < {})", rng.below(12))),
+    }
+}
+
+const PATTERNS: &[&str] =
+    &["'a%'", "'%a'", "'%et%'", "'_eta'", "'ALPHA'", "''", "'%'", "'it_s'", "'%l%a'", "'_____'", "'%m_a'", "'d%t%'"];
+
 /// A condition of any shape the parser knows.
 fn a_condition(rng: &mut Rng) -> String {
-    match rng.below(12) {
+    match rng.below(19) {
+        // The key against a number that is not whole, or against a text.
+        18 => match rng.below(4) {
+            0 => format!("id BETWEEN {}.5 AND {}.{}", rng.below(15), 10 + rng.below(15), rng.pick(&["0", "5"])),
+            1 => format!("id {} 'alpha'", rng.pick(&["<", ">", "="])),
+            _ => format!(
+                "id {} {}.{}",
+                rng.pick(&["=", "<>", "<", "<=", ">", ">="]),
+                rng.below(30),
+                rng.pick(&["0", "5"])
+            ),
+        },
+        12 => {
+            let not = rng.pick(&["", "NOT "]);
+            match rng.below(4) {
+                0 => format!("a {not}LIKE {}", rng.pick(&["'1%'", "'-_'", "'%0'", "'_'", "'-1_'"])),
+                1 => format!("id {not}LIKE {}", rng.pick(&["'%2'", "'1_'", "'_'"])),
+                _ => format!("c {not}LIKE {}", rng.pick(PATTERNS)),
+            }
+        }
+        13 => {
+            let not = rng.pick(&["", "NOT "]);
+            match rng.below(3) {
+                0 => format!("a {not}IN {}", a_list(rng, a_value)),
+                1 => format!("c {not}IN {}", a_list(rng, c_value)),
+                _ => format!("id {not}IN {}", a_list(rng, |rng| rng.below(30).to_string())),
+            }
+        }
+        14 => {
+            let (column, query) = a_column_query(rng);
+            format!("{column} {}IN ({query})", rng.pick(&["", "NOT "]))
+        }
+        15 => {
+            let (column, query) = a_value_query(rng);
+            format!("{column} {} {query}", rng.pick(&["=", "<>", "<", "<=", ">", ">="]))
+        }
+        16 => match rng.below(3) {
+            0 => format!("CASE WHEN a > {} THEN b ELSE a END > 1", rng.below(10) as i64 - 5),
+            1 => "CASE a WHEN 1 THEN 1 WHEN 2 THEN 0 WHEN 3 THEN NULL ELSE a END".to_string(),
+            _ => format!("CASE WHEN c IS NULL THEN a < 0 WHEN c LIKE {} THEN 1 END", rng.pick(PATTERNS)),
+        },
+        17 => match rng.below(4) {
+            0 => format!("instr(c, {}) {} {}", rng.pick(&["'a'", "'ta'", "''", "'s'"]), rng.pick(&["=", ">"]), rng.below(4)),
+            1 => format!("substr(c, {}, {}) = {}", rng.below(4), rng.below(4), rng.pick(&["'al'", "'eta'", "'t'", "''"])),
+            2 => format!("substr(c, -{}) = {}", rng.below(4), rng.pick(&["'ta'", "'a'", "'s'", "'lta'"])),
+            _ => format!("instr(a, '1') = {}", rng.below(3)),
+        },
         0..=3 => a_plain_condition(rng),
         4 => format!("{} IS {}NULL", rng.pick(&["a", "b", "c"]), rng.pick(&["", "NOT "])),
         5 => {
@@ -103,12 +192,32 @@ fn a_conflict(rng: &mut Rng) -> &'static str {
     }
 }
 
+/// Texts that are JSON. Every one starts with a curly bracket, which no
+/// other text in these tables does, so a query can tell them apart.
+const JSON: &[&str] = &[
+    r#"{"platform":"irc","n":3,"list":[1,2.5,"x y"],"deep":{"k":null,"ok":true}}"#,
+    r#"{ "platform" : "mail", "n" : -7, "list" : [ ], "deep" : { "k" : "it is", "ok" : false } }"#,
+    r#"{"n":1e2,"list":[[1,2],{"a":"b"}],"esc":"a\"b\\c\n\u00e9"}"#,
+    r#"{}"#,
+];
+
+const PATHS: &[&str] = &[
+    "$", "$.platform", "$.n", "$.list", "$.list[0]", "$.list[1]", "$.list[2]", "$.list[9]", "$.deep",
+    "$.deep.k", "$.deep.ok", "$.esc", "$.nope", "$.list[1].a", "$.\"platform\"",
+];
+
 /// A statement that changes something.
 fn a_change(rng: &mut Rng) -> String {
     // Now and then, put an index up or take one down. Both engines then
     // have the choice of using it, and both have to answer the same.
     if rng.one_in(40) {
-        return match rng.below(8) {
+        return match rng.below(12) {
+            // A column put on the end of a table that has rows in it. The
+            // second try at the same name is refused by both.
+            8 => "ALTER TABLE u ADD COLUMN extra INTEGER DEFAULT 5".into(),
+            9 => "ALTER TABLE s ADD COLUMN note TEXT".into(),
+            10 => "ALTER TABLE w ADD COLUMN y REAL NOT NULL DEFAULT 1.5".into(),
+            11 => "ALTER TABLE w ADD COLUMN z INTEGER NOT NULL".into(),
             0 => "CREATE INDEX ix_a ON t (a)".into(),
             1 => "DROP INDEX ix_a".into(),
             2 => "CREATE INDEX ix_ref ON u (ref)".into(),
@@ -119,7 +228,17 @@ fn a_change(rng: &mut Rng) -> String {
             _ => "DROP INDEX ix_v".into(),
         };
     }
-    match rng.below(20) {
+    match rng.below(23) {
+        // A text that is JSON, for json_extract to read.
+        20 => format!(
+            "INSERT OR REPLACE INTO u (id, ref, tag) VALUES ({}, NULL, '{}')",
+            rng.below(30),
+            rng.pick(JSON)
+        ),
+        // The added columns, which are not there at first. Until they
+        // are, both engines refuse these.
+        21 => format!("UPDATE u SET extra = {} WHERE id < {}", rng.below(9), rng.below(30)),
+        22 => format!("UPDATE s SET note = {} WHERE v > {}", c_value(rng), rng.below(20)),
         // The second table, which the first one is joined to. Its ref
         // has to point at a row of t, or both engines refuse it.
         0..=2 => format!(
@@ -174,9 +293,103 @@ struct Query {
     ordered: bool,
 }
 
+/// A LIMIT, with or without an OFFSET, for a query whose order is total.
+fn a_window(rng: &mut Rng) -> String {
+    match rng.below(5) {
+        0 => String::new(),
+        1 => format!(" LIMIT {}", rng.below(6)),
+        2 => format!(" LIMIT {} OFFSET {}", rng.below(6), rng.below(8)),
+        3 => format!(" LIMIT -1 OFFSET {}", rng.below(8)),
+        _ => format!(" LIMIT 1 + {} OFFSET {} * 2", rng.below(4), rng.below(4)),
+    }
+}
+
 /// A statement that reads.
 fn a_query(rng: &mut Rng) -> Query {
-    match rng.below(14) {
+    match rng.below(21) {
+        // Groups, in no order: one row for each value of something.
+        10 => {
+            let (what, by) = match rng.below(8) {
+                0 => ("a, COUNT(*), SUM(b)", "a"),
+                1 => ("c, COUNT(*) AS cnt, SUM(CASE WHEN a > 0 THEN 1 ELSE 0 END) AS pos", "c"),
+                2 => ("a, c, COUNT(*), MIN(b), MAX(id)", "a, c"),
+                3 => ("a + 1, COUNT(b)", "a + 1"),
+                4 => ("a IS NULL, COUNT(*), SUM(a)", "a IS NULL"),
+                5 => ("b, COUNT(*)", "b"),
+                6 => ("c, MAX(a) - MIN(a), COUNT(c)", "1"),
+                _ => ("substr(c, 1, 1) AS first, COUNT(*)", "first"),
+            };
+            Query { sql: format!("SELECT {what} FROM t{} GROUP BY {by}", a_where(rng)), ordered: false }
+        }
+        // Groups in an order, which the key of the group makes total,
+        // so a LIMIT and an OFFSET can cut them. Also over a join.
+        11 => {
+            let sql = match rng.below(6) {
+                0 => format!("SELECT c, COUNT(*) AS n, MIN(a), MAX(b) FROM t{} GROUP BY c ORDER BY n DESC, c", a_where(rng)),
+                1 => format!("SELECT a, COUNT(*) FROM t{} GROUP BY 1 ORDER BY 2 DESC, 1", a_where(rng)),
+                2 => format!("SELECT a, SUM(id) FROM t{} GROUP BY a ORDER BY SUM(id), a DESC", a_where(rng)),
+                3 => "SELECT t.id, COUNT(*), MAX(u.id) FROM t JOIN u ON t.id = u.ref GROUP BY t.id ORDER BY t.id".to_string(),
+                4 => "SELECT u.tag, COUNT(*), SUM(t.a) FROM u JOIN t ON u.ref = t.id GROUP BY u.tag ORDER BY u.tag".to_string(),
+                _ => format!("SELECT d, COUNT(*), SUM(x) FROM w WHERE h < {} GROUP BY d ORDER BY d DESC", rng.below(5)),
+            };
+            Query { sql: format!("{sql}{}", a_window(rng)), ordered: true }
+        }
+        // No row twice. Sorted by everything asked for, the order is
+        // total, and a window can be cut out of it.
+        12 => match rng.below(6) {
+            0 => Query { sql: format!("SELECT DISTINCT a FROM t{}", a_where(rng)), ordered: false },
+            1 => Query { sql: format!("SELECT DISTINCT c, a IS NULL FROM t{}", a_where(rng)), ordered: false },
+            2 => Query { sql: "SELECT DISTINCT u.tag FROM u JOIN t ON u.ref = t.id".into(), ordered: false },
+            3 => Query {
+                sql: format!("SELECT DISTINCT c, a FROM t{} ORDER BY c, a DESC{}", a_where(rng), a_window(rng)),
+                ordered: true,
+            },
+            4 => Query {
+                sql: format!("SELECT DISTINCT a FROM t{} ORDER BY a{}", a_where(rng), a_window(rng)),
+                ordered: true,
+            },
+            _ => Query { sql: format!("SELECT DISTINCT ref, tag FROM u ORDER BY 2 DESC, 1{}", a_window(rng)), ordered: true },
+        },
+        // A window out of sorted rows.
+        13 => {
+            let what = rng.pick(&["id", "id, a", "*", "c, id"]);
+            let by = rng.pick(&["id", "id DESC", "a, id", "c DESC, id", "b DESC, id DESC"]);
+            Query { sql: format!("SELECT {what} FROM t{} ORDER BY {by}{}", a_where(rng), a_window(rng)), ordered: true }
+        }
+        // Things worked out for each row: CASE, the text functions, and
+        // what LIKE, IN and a query inside say when the answer is null.
+        14 => {
+            let (column, query) = a_column_query(rng);
+            let what = match rng.below(7) {
+                0 => format!("substr(c, {}, {}), substr(c, {})", rng.below(8) as i64 - 3, rng.below(7) as i64 - 2, rng.below(8) as i64 - 4),
+                1 => format!("instr(c, {}), instr(a, '-'), substr(a, 1, 1)", rng.pick(&["'a'", "'ta'", "''", "'eta'"])),
+                2 => "CASE WHEN a > 0 THEN 'pos' WHEN a < 0 THEN 'neg' ELSE c END, CASE c WHEN 'beta' THEN 1 WHEN '' THEN 2 END".to_string(),
+                3 => format!("c LIKE {}, c NOT LIKE {}, a LIKE '1%'", rng.pick(PATTERNS), rng.pick(PATTERNS)),
+                4 => format!("a IN {}, c NOT IN {}", a_list(rng, a_value), a_list(rng, c_value)),
+                5 => format!("{column} IN ({query}), {column} NOT IN ({query})"),
+                _ => "(SELECT COUNT(*) FROM u), a - (SELECT MIN(a) FROM t)".to_string(),
+            };
+            Query { sql: format!("SELECT id, {what} FROM t{} ORDER BY id", a_where(rng)), ordered: true }
+        }
+        // JSON, written into the query and kept in a text column, and
+        // the columns that are added along the way.
+        15 => {
+            let sql = match rng.below(6) {
+                0 => format!("SELECT json_extract('{}', '{}') FROM s", rng.pick(JSON), rng.pick(PATHS)),
+                1..=2 => format!(
+                    "SELECT id, json_extract(tag, '{}'), json_extract(tag, '{}') FROM u WHERE tag LIKE '{{%' ORDER BY id",
+                    rng.pick(PATHS),
+                    rng.pick(PATHS)
+                ),
+                3 => format!(
+                    "SELECT id FROM u WHERE CASE WHEN tag LIKE '{{%' THEN json_extract(tag, '$.n') > {} END ORDER BY id",
+                    rng.below(4)
+                ),
+                4 => "SELECT id FROM u WHERE instr(tag, '\"platform\":\"irc\"') > 0 ORDER BY id".to_string(),
+                _ => "SELECT id, extra FROM u ORDER BY id".to_string(),
+            };
+            Query { sql, ordered: true }
+        }
         // Aggregates, which give one row.
         0..=1 => {
             let what = rng.pick(&[
@@ -402,7 +615,8 @@ fn run_it(seed: u64, rounds: usize, place: Where) {
         // How many rows changed is only a question for statements that
         // change rows. After a CREATE INDEX, SQLite reports whatever the
         // count happened to be beforehand.
-        let touches_rows = !sql.starts_with("CREATE") && !sql.starts_with("DROP");
+        let touches_rows =
+            !sql.starts_with("CREATE") && !sql.starts_with("DROP") && !sql.starts_with("ALTER");
         if touches_rows {
             if let (Ok(n), Ok(out)) = (&theirs, &mine) {
                 assert_eq!(

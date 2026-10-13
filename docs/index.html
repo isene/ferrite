@@ -165,7 +165,7 @@
         <tbody>
           <tr><td>Where the rows live</td><td>On disk in pages, with a cache in memory</td><td>In memory. A log and a snapshot on disk</td></tr>
           <tr><td>How much it holds</td><td>Up to terabytes</td><td>What fits in RAM</td></tr>
-          <tr><td>SQL</td><td>The whole language. Views, triggers, subqueries, window functions.</td><td>The core. Tables with defaults, unique and foreign keys, indexes over one column or several, one inner join, WHERE with AND, OR, NOT, IS NULL, BETWEEN and arithmetic, ORDER BY, LIMIT, the four aggregates, INSERT OR IGNORE and OR REPLACE, transactions.</td></tr>
+          <tr><td>SQL</td><td>The whole language. Views, triggers, outer joins, UNION, window functions.</td><td>The core. Tables with defaults, unique and foreign keys, ALTER TABLE ADD COLUMN, indexes over one column or several, one inner join, WHERE with AND, OR, NOT, IS NULL, BETWEEN, LIKE, IN, CASE and arithmetic, DISTINCT, GROUP BY, ORDER BY, LIMIT and OFFSET, the four aggregates, substr, instr and json_extract, a query inside another, INSERT OR IGNORE and OR REPLACE, transactions.</td></tr>
           <tr><td>Types</td><td>Five, bent to fit the column. A string goes into an INTEGER column and stays a string.</td><td>Five, kept as declared. A string in an INTEGER column is refused.</td></tr>
           <tr><td>Durability</td><td>FULL or NORMAL; FULL by default</td><td>FULL or NORMAL; NORMAL by default, and the README says so first</td></tr>
           <tr><td>Crash safety</td><td>Decades of it</td><td>Killed mid-write 10,000 times in each mode. No committed row lost, no file that would not open</td></tr>

@@ -26,6 +26,7 @@
 //! assert_eq!(db.table(kv).get(1).unwrap()[0], Value::Int(7));
 //! ```
 
+mod func;
 pub mod log;
 pub mod plan;
 pub mod sql;
@@ -361,6 +362,12 @@ impl Table {
     pub(crate) fn get_mut(&mut self, key: i64) -> Option<&mut Row> {
         let slot = *self.rows.get(&key)?;
         self.slab[slot as usize].as_mut()
+    }
+
+    /// One more column on the end, with its default in every row.
+    pub(crate) fn widen(&mut self, column: Column) {
+        for row in self.slab.iter_mut().flatten() { row.push(column.default.clone()); }
+        self.columns.push(column);
     }
 
     pub(crate) fn clear(&mut self) {
@@ -849,6 +856,33 @@ impl Db {
             let was = self.tables[table.0].get(key).cloned();
             self.undo.push(Undo::Was(table, key, was));
         }
+    }
+
+    /// Put one more column on the end of a table. Every row already
+    /// there gets the column's default in it.
+    ///
+    /// It is refused inside a transaction: a rollback puts rows back
+    /// the way they were, and they would be one value short.
+    pub fn add_column(&mut self, table: TableId, column: Column) -> Result<()> {
+        if self.in_txn {
+            return Err(Error::Sql("a column cannot be added inside a transaction".to_string()));
+        }
+        let t = &self.tables[table.0];
+        if t.key == column.name || t.column_of(&column.name).is_some() {
+            return Err(Error::Sql(format!("{} already has a column called {}", t.name, column.name)));
+        }
+        if column.default == Value::Null && !column.null_ok {
+            return Err(Error::NotNull(column.name));
+        }
+        if column.default != Value::Null && !column.default.fits(column.kind) {
+            return Err(Error::WrongKind {
+                column: column.name,
+                want: column.kind.name(),
+                got: column.default.type_name(),
+            });
+        }
+        self.tables[table.0].widen(column.clone());
+        self.record(Change::AddColumn { table: table.0 as u32, column })
     }
 
     /// Throw a table away, with everything in it. A table that other
@@ -1391,6 +1425,11 @@ impl Db {
                     if let Some(t) = self.tables.get_mut(table as usize) {
                         t.next = t.next.max(key);
                     }
+                }
+                Change::AddColumn { table, column } => {
+                    let t = self.tables.get_mut(table as usize)
+                        .ok_or_else(|| Error::Disk(format!("the log names table {table}, which is not there")))?;
+                    t.widen(column);
                 }
                 Change::NewIndex { name, table, columns, unique } => {
                     let t = self.tables.get(table as usize)

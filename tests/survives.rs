@@ -222,3 +222,32 @@ fn a_key_handed_out_once_is_not_handed_out_again_after_a_reopen() {
     assert_eq!(rows_of(&db, "SELECT k, v FROM s WHERE k = 'b'"), vec![vec![Value::Text("b".into()), Value::Int(3)]]);
     assert_eq!(rows_of(&db, "SELECT rowid FROM s WHERE k = 'b'"), vec![vec![Value::Int(2)]]);
 }
+
+#[test]
+fn an_added_column_is_still_there_after_a_reopen() {
+    let dir = Dir::new("addcolumn");
+    {
+        let mut db = Db::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE kv (id INTEGER PRIMARY KEY, a INTEGER)", &[]).unwrap();
+        db.execute("INSERT INTO kv (id, a) VALUES (1, 10)", &[]).unwrap();
+        db.execute("ALTER TABLE kv ADD COLUMN c TEXT DEFAULT 'old'", &[]).unwrap();
+        db.execute("INSERT INTO kv (id, a, c) VALUES (2, 20, 'new')", &[]).unwrap();
+        db.execute("UPDATE kv SET a = 11 WHERE id = 1", &[]).unwrap();
+        db.flush().unwrap();
+    }
+    let want = vec![
+        vec![Value::Int(1), Value::Int(11), Value::Text("old".into())],
+        vec![Value::Int(2), Value::Int(20), Value::Text("new".into())],
+    ];
+    {
+        // First from the log, where the column comes after the first row.
+        let mut db = Db::open(dir.path()).unwrap();
+        assert_eq!(rows_of(&db, "SELECT * FROM kv ORDER BY id"), want);
+        // Then from a snapshot, which writes the table with every column.
+        db.checkpoint().unwrap();
+    }
+    let mut db = Db::open(dir.path()).unwrap();
+    assert_eq!(rows_of(&db, "SELECT * FROM kv ORDER BY id"), want);
+    db.execute("INSERT INTO kv (id, a) VALUES (3, 30)", &[]).unwrap();
+    assert_eq!(rows_of(&db, "SELECT c FROM kv WHERE id = 3"), vec![vec![Value::Text("old".into())]]);
+}

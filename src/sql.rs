@@ -166,6 +166,10 @@ impl std::fmt::Display for Name {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Func { Count, Sum, Min, Max }
 
+/// The functions of plain values a query can call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Scalar { Substr, Instr, JsonExtract }
+
 /// What joins the two sides of an expression.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
@@ -196,34 +200,132 @@ pub enum Expr {
     Coalesce(Vec<Expr>),
     /// `COUNT(*)` has no argument; the others have one.
     Agg(Func, Option<Box<Expr>>),
+    /// `x IN (a, b, ...)`, or `NOT IN` when the flag is set.
+    In { what: Box<Expr>, list: Vec<Expr>, not: bool },
+    /// `x IN (SELECT ...)`. The query inside is answered before the
+    /// statement runs, and its answers become the list.
+    InQuery { what: Box<Expr>, query: Box<Select>, not: bool },
+    /// `(SELECT ...)` standing for one value: the first column of the
+    /// first row, or null when there is no row.
+    Query(Box<Select>),
+    /// `x LIKE pattern`, or `NOT LIKE` when the flag is set.
+    Like { what: Box<Expr>, pattern: Box<Expr>, not: bool },
+    /// `CASE WHEN a THEN b ... ELSE c END`: the value beside the first
+    /// condition that is true.
+    Case { whens: Vec<(Expr, Expr)>, otherwise: Option<Box<Expr>> },
+    /// A function of plain values, like `substr(c, 1, 3)`.
+    Call(Scalar, Vec<Expr>),
 }
 
 impl Expr {
-    /// True when an aggregate sits anywhere inside.
-    pub fn has_aggregate(&self) -> bool {
+    /// Call `f` on this expression and on every one inside it. A query
+    /// inside is not gone into: what it holds is its own.
+    fn walk<'a>(&'a self, f: &mut dyn FnMut(&'a Expr)) {
+        f(self);
         match self {
-            Expr::Agg(..) => true,
-            Expr::Lit(_) | Expr::Param(_) | Expr::Column(_) => false,
-            Expr::Not(e) | Expr::IsNull(e, _) => e.has_aggregate(),
+            Expr::Lit(_) | Expr::Param(_) | Expr::Column(_) | Expr::Query(_) => {}
+            Expr::Not(e) | Expr::IsNull(e, _) | Expr::InQuery { what: e, .. } => e.walk(f),
             Expr::Between { what, low, high, .. } => {
-                what.has_aggregate() || low.has_aggregate() || high.has_aggregate()
+                what.walk(f);
+                low.walk(f);
+                high.walk(f);
             }
-            Expr::Bin(a, _, b) => a.has_aggregate() || b.has_aggregate(),
-            Expr::Coalesce(v) => v.iter().any(Expr::has_aggregate),
+            Expr::Bin(a, _, b) | Expr::Like { what: a, pattern: b, .. } => {
+                a.walk(f);
+                b.walk(f);
+            }
+            Expr::Coalesce(v) | Expr::Call(_, v) => v.iter().for_each(|e| e.walk(f)),
+            Expr::Agg(_, e) => {
+                if let Some(e) = e { e.walk(f); }
+            }
+            Expr::In { what, list, .. } => {
+                what.walk(f);
+                list.iter().for_each(|e| e.walk(f));
+            }
+            Expr::Case { whens, otherwise } => {
+                for (when, then) in whens {
+                    when.walk(f);
+                    then.walk(f);
+                }
+                if let Some(e) = otherwise { e.walk(f); }
+            }
         }
+    }
+
+    /// The expressions directly inside this one, to change them.
+    fn parts_mut(&mut self) -> Vec<&mut Expr> {
+        match self {
+            Expr::Lit(_) | Expr::Param(_) | Expr::Column(_) | Expr::Query(_) => Vec::new(),
+            Expr::Not(e) | Expr::IsNull(e, _) | Expr::InQuery { what: e, .. } => vec![&mut **e],
+            Expr::Between { what, low, high, .. } => vec![&mut **what, &mut **low, &mut **high],
+            Expr::Bin(a, _, b) | Expr::Like { what: a, pattern: b, .. } => vec![&mut **a, &mut **b],
+            Expr::Coalesce(v) | Expr::Call(_, v) => v.iter_mut().collect(),
+            Expr::Agg(_, e) => e.iter_mut().map(|e| &mut **e).collect(),
+            Expr::In { what, list, .. } => std::iter::once(&mut **what).chain(list).collect(),
+            Expr::Case { whens, otherwise } => whens
+                .iter_mut()
+                .flat_map(|(when, then)| [when, then])
+                .chain(otherwise.iter_mut().map(|e| &mut **e))
+                .collect(),
+        }
+    }
+
+    /// True when `f` is true of this expression or of one inside it.
+    fn any(&self, f: &dyn Fn(&Expr) -> bool) -> bool {
+        let mut found = false;
+        self.walk(&mut |e| found |= f(e));
+        found
+    }
+
+    /// True when an aggregate sits anywhere inside.
+    pub fn has_aggregate(&self) -> bool { self.any(&|e| matches!(e, Expr::Agg(..))) }
+
+    /// True when a query sits anywhere inside.
+    pub fn has_query(&self) -> bool {
+        self.any(&|e| matches!(e, Expr::Query(_) | Expr::InQuery { .. }))
+    }
+
+    /// True when it can be worked out with no row and no `?` slot, as
+    /// `100 - 5` can.
+    pub fn is_constant(&self) -> bool {
+        !self.any(&|e| {
+            matches!(
+                e,
+                Expr::Param(_) | Expr::Column(_) | Expr::Agg(..) | Expr::Query(_) | Expr::InQuery { .. }
+            )
+        })
     }
 
     /// The highest `?` slot used, plus one.
     pub fn params(&self) -> usize {
-        match self {
-            Expr::Param(n) => n + 1,
-            Expr::Lit(_) | Expr::Column(_) => 0,
-            Expr::Not(e) | Expr::IsNull(e, _) => e.params(),
-            Expr::Between { what, low, high, .. } => what.params().max(low.params()).max(high.params()),
-            Expr::Bin(a, _, b) => a.params().max(b.params()),
-            Expr::Coalesce(v) => v.iter().map(Expr::params).max().unwrap_or(0),
-            Expr::Agg(_, e) => e.as_ref().map_or(0, |e| e.params()),
-        }
+        let mut most = 0;
+        self.walk(&mut |e| {
+            most = most.max(match e {
+                Expr::Param(n) => n + 1,
+                Expr::Query(q) | Expr::InQuery { query: q, .. } => q.params(),
+                _ => 0,
+            })
+        });
+        most
+    }
+
+    /// Put the answer of every query inside in its place: one value
+    /// where the query stands for a value, a list where it stands
+    /// behind IN. `answer` gives the first column of each row a query
+    /// comes back with.
+    pub fn settle(&mut self, answer: &mut dyn FnMut(&Select) -> Result<Vec<Value>>) -> Result<()> {
+        for e in self.parts_mut() { e.settle(answer)?; }
+        let settled = match self {
+            Expr::Query(q) => Expr::Lit(answer(q)?.into_iter().next().unwrap_or(Value::Null)),
+            Expr::InQuery { what, query, not } => Expr::In {
+                what: std::mem::replace(what, Box::new(Expr::Lit(Value::Null))),
+                list: answer(query)?.into_iter().map(Expr::Lit).collect(),
+                not: *not,
+            },
+            _ => return Ok(()),
+        };
+        *self = settled;
+        Ok(())
     }
 
     /// The parts of an AND chain, so `a AND b AND c` is three things.
@@ -283,6 +385,59 @@ pub struct ForeignKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OnConflict { Fail, Ignore, Replace }
 
+/// A SELECT, as written.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Select {
+    pub table: String,
+    pub alias: Option<String>,
+    pub join: Option<Join>,
+    /// `SELECT DISTINCT`: no row comes back twice.
+    pub distinct: bool,
+    pub project: Project,
+    /// The name each item of the select list was given, if any. ORDER
+    /// BY and GROUP BY can use it in place of the item.
+    pub names: Vec<Option<String>>,
+    pub filter: Option<Expr>,
+    pub group: Vec<Expr>,
+    pub order: Vec<Order>,
+    pub limit: Option<Expr>,
+    pub offset: Option<Expr>,
+}
+
+impl Select {
+    /// Call `f` on every expression written in it. What a query inside
+    /// holds is its own, and is not among them.
+    fn each<'a>(&'a self, f: &mut dyn FnMut(&'a Expr)) {
+        if let Some(j) = &self.join { f(&j.on); }
+        if let Project::Exprs(items) = &self.project { items.iter().for_each(&mut *f); }
+        self.filter.iter().for_each(&mut *f);
+        self.group.iter().for_each(&mut *f);
+        self.order.iter().for_each(|o| f(&o.expr));
+        self.limit.iter().for_each(&mut *f);
+        self.offset.iter().for_each(&mut *f);
+    }
+
+    /// The same expressions, to change them.
+    pub fn exprs_mut(&mut self) -> Vec<&mut Expr> {
+        let mut all: Vec<&mut Expr> = Vec::new();
+        if let Some(j) = &mut self.join { all.push(&mut j.on); }
+        if let Project::Exprs(items) = &mut self.project { all.extend(items); }
+        all.extend(&mut self.filter);
+        all.extend(&mut self.group);
+        all.extend(self.order.iter_mut().map(|o| &mut o.expr));
+        all.extend(&mut self.limit);
+        all.extend(&mut self.offset);
+        all
+    }
+
+    /// How many `?` slots it wants.
+    pub fn params(&self) -> usize {
+        let mut most = 0;
+        self.each(&mut |e| most = most.max(e.params()));
+        most
+    }
+}
+
 /// One statement, as written. Nothing here has been checked against a
 /// real table yet.
 #[derive(Debug, Clone, PartialEq)]
@@ -300,16 +455,10 @@ pub enum Stmt {
     DropTable { name: String, if_there: bool },
     CreateIndex { name: String, table: String, columns: Vec<String>, unique: bool, if_missing: bool },
     DropIndex { name: String, if_there: bool },
+    /// `ALTER TABLE t ADD COLUMN ...`: one more column on the end.
+    AddColumn { table: String, column: ColDef },
     Insert { table: String, columns: Vec<String>, values: Vec<Expr>, on_conflict: OnConflict },
-    Select {
-        table: String,
-        alias: Option<String>,
-        join: Option<Join>,
-        project: Project,
-        filter: Option<Expr>,
-        order: Vec<Order>,
-        limit: Option<usize>,
-    },
+    Select(Select),
     Update { table: String, sets: Vec<(String, Expr)>, filter: Option<Expr> },
     Delete { table: String, filter: Option<Expr> },
     Begin,
@@ -320,27 +469,43 @@ pub enum Stmt {
 }
 
 impl Stmt {
+    /// Call `f` on every expression written in it.
+    fn each<'a>(&'a self, f: &mut dyn FnMut(&'a Expr)) {
+        match self {
+            Stmt::Insert { values, .. } => values.iter().for_each(f),
+            Stmt::Select(s) => s.each(f),
+            Stmt::Update { sets, filter, .. } => {
+                sets.iter().for_each(|(_, e)| f(e));
+                filter.iter().for_each(f);
+            }
+            Stmt::Delete { filter, .. } => filter.iter().for_each(f),
+            _ => {}
+        }
+    }
+
+    /// The same expressions, to change them.
+    pub fn exprs_mut(&mut self) -> Vec<&mut Expr> {
+        match self {
+            Stmt::Insert { values, .. } => values.iter_mut().collect(),
+            Stmt::Select(s) => s.exprs_mut(),
+            Stmt::Update { sets, filter, .. } => sets.iter_mut().map(|(_, e)| e).chain(filter).collect(),
+            Stmt::Delete { filter, .. } => filter.iter_mut().collect(),
+            _ => Vec::new(),
+        }
+    }
+
     /// How many `?` slots the statement wants.
     pub fn params(&self) -> usize {
-        let of = |es: &[&Expr]| es.iter().map(|e| e.params()).max().unwrap_or(0);
-        match self {
-            Stmt::Insert { values, .. } => of(&values.iter().collect::<Vec<_>>()),
-            Stmt::Select { join, project, filter, order, .. } => {
-                let mut all: Vec<&Expr> = Vec::new();
-                if let Some(j) = join { all.push(&j.on); }
-                if let Project::Exprs(items) = project { all.extend(items.iter()); }
-                if let Some(f) = filter { all.push(f); }
-                all.extend(order.iter().map(|o| &o.expr));
-                of(&all)
-            }
-            Stmt::Update { sets, filter, .. } => {
-                let mut all: Vec<&Expr> = sets.iter().map(|(_, e)| e).collect();
-                if let Some(f) = filter { all.push(f); }
-                of(&all)
-            }
-            Stmt::Delete { filter, .. } => filter.as_ref().map_or(0, Expr::params),
-            _ => 0,
-        }
+        let mut most = 0;
+        self.each(&mut |e| most = most.max(e.params()));
+        most
+    }
+
+    /// True when a query sits inside it, as in `x IN (SELECT ...)`.
+    pub fn has_query(&self) -> bool {
+        let mut found = false;
+        self.each(&mut |e| found |= e.has_query());
+        found
     }
 }
 
@@ -482,7 +647,8 @@ impl Parser {
         if self.eat_word("create") { return self.create(); }
         if self.eat_word("drop") { return self.drop(); }
         if self.eat_word("insert") { return self.insert(); }
-        if self.eat_word("select") { return self.select(); }
+        if self.eat_word("select") { return Ok(Stmt::Select(self.select()?)); }
+        if self.eat_word("alter") { return self.alter(); }
         if self.eat_word("update") { return self.update(); }
         if self.eat_word("delete") { return self.delete(); }
         if self.eat_word("pragma") {
@@ -638,6 +804,19 @@ impl Parser {
         Ok(Stmt::DropTable { name: self.name()?, if_there })
     }
 
+    /// `ALTER TABLE t ADD COLUMN ...`, which is the one ALTER there is.
+    fn alter(&mut self) -> Result<Stmt> {
+        self.want_word("table")?;
+        let table = self.name()?;
+        self.want_word("add")?;
+        self.eat_word("column");
+        let (column, foreign_key) = self.column_def()?;
+        if column.primary || column.unique || foreign_key.is_some() {
+            return Err(sql_err("a column added later cannot be a key, unique or a foreign key"));
+        }
+        Ok(Stmt::AddColumn { table, column })
+    }
+
     fn insert(&mut self) -> Result<Stmt> {
         let on_conflict = if self.eat_word("or") {
             if self.eat_word("ignore") {
@@ -671,15 +850,21 @@ impl Parser {
         Ok(Stmt::Insert { table, columns, values, on_conflict })
     }
 
-    fn select(&mut self) -> Result<Stmt> {
+    /// The word SELECT has been read.
+    fn select(&mut self) -> Result<Select> {
+        let distinct = self.eat_word("distinct");
+        if !distinct { self.eat_word("all"); }
+        let mut names = Vec::new();
         let project = if self.eat_sym('*') {
             Project::All
         } else {
             let mut items = Vec::new();
             loop {
                 items.push(self.expr()?);
-                // A name for the column, which nothing here uses.
-                if self.eat_word("as") { self.name()?; }
+                // A name for the item, with or without AS in front.
+                let named = self.eat_word("as")
+                    || matches!(self.peek(), Some(Tok::Word(w)) if !w.eq_ignore_ascii_case("from"));
+                names.push(if named { Some(self.name()?) } else { None });
                 if !self.eat_sym(',') { break; }
             }
             Project::Exprs(items)
@@ -688,16 +873,21 @@ impl Parser {
         let (table, alias) = self.table_and_alias()?;
         let join = self.join_clause()?;
         let filter = self.where_clause()?;
-        let order = self.order_clause()?;
-        let limit = if self.eat_word("limit") {
-            match self.next() {
-                Some(Tok::Int(n)) if n >= 0 => Some(n as usize),
-                _ => return Err(sql_err("LIMIT wants a whole number")),
+        let mut group = Vec::new();
+        if self.eat_word("group") {
+            self.want_word("by")?;
+            loop {
+                group.push(self.expr()?);
+                if !self.eat_sym(',') { break; }
             }
-        } else {
-            None
-        };
-        Ok(Stmt::Select { table, alias, join, project, filter, order, limit })
+        }
+        let order = self.order_clause()?;
+        let (mut limit, mut offset) = (None, None);
+        if self.eat_word("limit") {
+            limit = Some(self.expr()?);
+            if self.eat_word("offset") { offset = Some(self.expr()?); }
+        }
+        Ok(Select { table, alias, join, distinct, project, names, filter, group, order, limit, offset })
     }
 
     fn join_clause(&mut self) -> Result<Option<Join>> {
@@ -795,6 +985,21 @@ impl Parser {
             let high = self.additive()?;
             return Ok(Expr::Between { what: Box::new(left), low: Box::new(low), high: Box::new(high), not });
         }
+        if self.eat_word("in") {
+            self.want_sym('(')?;
+            let what = Box::new(left);
+            if self.eat_word("select") {
+                let query = Box::new(self.select()?);
+                self.want_sym(')')?;
+                return Ok(Expr::InQuery { what, query, not });
+            }
+            let list = self.values_to_bracket()?;
+            return Ok(Expr::In { what, list, not });
+        }
+        if self.eat_word("like") {
+            let pattern = self.additive()?;
+            return Ok(Expr::Like { what: Box::new(left), pattern: Box::new(pattern), not });
+        }
         self.at = save;
         if let Some(Tok::Cmp(c)) = self.peek().cloned() {
             self.at += 1;
@@ -853,6 +1058,11 @@ impl Parser {
 
     fn primary(&mut self) -> Result<Expr> {
         if self.eat_sym('(') {
+            if self.eat_word("select") {
+                let query = self.select()?;
+                self.want_sym(')')?;
+                return Ok(Expr::Query(Box::new(query)));
+            }
             let inner = self.expr()?;
             self.want_sym(')')?;
             return Ok(inner);
@@ -867,6 +1077,7 @@ impl Parser {
                 if up == "NULL" { return Ok(Expr::Lit(Value::Null)); }
                 if up == "TRUE" { return Ok(Expr::Lit(Value::Int(1))); }
                 if up == "FALSE" { return Ok(Expr::Lit(Value::Int(0))); }
+                if up == "CASE" { return self.case(); }
                 if self.eat_sym('(') { return self.call(&up); }
                 if self.eat_sym('.') {
                     let column = self.name()?;
@@ -898,16 +1109,56 @@ impl Parser {
             self.want_sym(')')?;
             return Ok(Expr::Agg(func, Some(Box::new(arg))));
         }
-        if name == "COALESCE" || name == "IFNULL" {
-            let mut args = Vec::new();
-            loop {
-                args.push(self.expr()?);
-                if !self.eat_sym(',') { break; }
-            }
-            self.want_sym(')')?;
-            return Ok(Expr::Coalesce(args));
+        let takes = match name {
+            "COALESCE" | "IFNULL" => 1..=usize::MAX,
+            "SUBSTR" | "SUBSTRING" => 2..=3,
+            "INSTR" | "JSON_EXTRACT" => 2..=2,
+            _ => return Err(sql_err(&format!("I do not know a function called {name}"))),
+        };
+        let args = self.values_to_bracket()?;
+        if !takes.contains(&args.len()) {
+            return Err(sql_err(&format!("{name} does not take {} values", args.len())));
         }
-        Err(sql_err(&format!("I do not know a function called {name}")))
+        Ok(match name {
+            "COALESCE" | "IFNULL" => Expr::Coalesce(args),
+            "INSTR" => Expr::Call(Scalar::Instr, args),
+            "JSON_EXTRACT" => Expr::Call(Scalar::JsonExtract, args),
+            _ => Expr::Call(Scalar::Substr, args),
+        })
+    }
+
+    /// Values with commas between them, up to and over the closing
+    /// bracket. There may be none.
+    fn values_to_bracket(&mut self) -> Result<Vec<Expr>> {
+        let mut out = Vec::new();
+        if self.eat_sym(')') { return Ok(out); }
+        loop {
+            out.push(self.expr()?);
+            if !self.eat_sym(',') { break; }
+        }
+        self.want_sym(')')?;
+        Ok(out)
+    }
+
+    /// The word CASE has been read.
+    fn case(&mut self) -> Result<Expr> {
+        // `CASE x WHEN 1 THEN ...` asks whether x equals each value in
+        // turn, so it is read as `CASE WHEN x = 1 THEN ...`.
+        let subject = if self.peek_word("when") { None } else { Some(self.expr()?) };
+        let mut whens = Vec::new();
+        while self.eat_word("when") {
+            let when = self.expr()?;
+            let when = match &subject {
+                Some(x) => Expr::Bin(Box::new(x.clone()), Op::Cmp(Cmp::Eq), Box::new(when)),
+                None => when,
+            };
+            self.want_word("then")?;
+            whens.push((when, self.expr()?));
+        }
+        if whens.is_empty() { return Err(sql_err("I expected WHEN here")); }
+        let otherwise = if self.eat_word("else") { Some(Box::new(self.expr()?)) } else { None };
+        self.want_word("end")?;
+        Ok(Expr::Case { whens, otherwise })
     }
 }
 
@@ -921,7 +1172,7 @@ mod tests {
 
     fn filter_of(sql: &str) -> Expr {
         match parse(sql).unwrap() {
-            Stmt::Select { filter, .. } => filter.unwrap(),
+            Stmt::Select(Select { filter, .. }) => filter.unwrap(),
             other => panic!("{other:?}"),
         }
     }
@@ -995,7 +1246,7 @@ mod tests {
     #[test]
     fn a_bare_question_mark_counts_itself() {
         let s = parse("SELECT a FROM kv WHERE id = ? AND a = ?").unwrap();
-        let Stmt::Select { filter, .. } = &s else { panic!() };
+        let Stmt::Select(Select { filter, .. }) = &s else { panic!() };
         assert_eq!(
             filter.clone().unwrap(),
             bin(bin(col("id"), Op::Cmp(Cmp::Eq), Expr::Param(0)), Op::And, bin(col("a"), Op::Cmp(Cmp::Eq), Expr::Param(1)))
@@ -1063,30 +1314,30 @@ mod tests {
 
     #[test]
     fn a_select_list_takes_a_star_columns_expressions_and_aggregates() {
-        let Stmt::Select { project, .. } = parse("SELECT * FROM kv").unwrap() else { panic!() };
+        let Stmt::Select(Select { project, .. }) = parse("SELECT * FROM kv").unwrap() else { panic!() };
         assert_eq!(project, Project::All);
-        let Stmt::Select { project, .. } = parse("SELECT a, c FROM kv").unwrap() else { panic!() };
+        let Stmt::Select(Select { project, .. }) = parse("SELECT a, c FROM kv").unwrap() else { panic!() };
         assert_eq!(project, Project::Exprs(vec![col("a"), col("c")]));
-        let Stmt::Select { project, .. } = parse("SELECT COUNT(*) > 0, COALESCE(a, id) AS x FROM kv").unwrap() else { panic!() };
+        let Stmt::Select(Select { project, .. }) = parse("SELECT COUNT(*) > 0, COALESCE(a, id) AS x FROM kv").unwrap() else { panic!() };
         let Project::Exprs(items) = project else { panic!() };
         assert_eq!(items[0], bin(Expr::Agg(Func::Count, None), Op::Cmp(Cmp::Gt), int(0)));
         assert_eq!(items[1], Expr::Coalesce(vec![col("a"), col("id")]));
         assert!(items[0].has_aggregate());
         assert!(!items[1].has_aggregate());
         for (text, func) in [("SUM", Func::Sum), ("MIN", Func::Min), ("MAX", Func::Max), ("COUNT", Func::Count)] {
-            let Stmt::Select { project, .. } = parse(&format!("SELECT {text}(a) FROM kv")).unwrap() else { panic!() };
+            let Stmt::Select(Select { project, .. }) = parse(&format!("SELECT {text}(a) FROM kv")).unwrap() else { panic!() };
             assert_eq!(project, Project::Exprs(vec![Expr::Agg(func, Some(Box::new(col("a"))))]));
         }
         assert!(parse("SELECT SUM(*) FROM kv").is_err());
         // A column called count is still a column.
-        let Stmt::Select { project, .. } = parse("SELECT count FROM kv").unwrap() else { panic!() };
+        let Stmt::Select(Select { project, .. }) = parse("SELECT count FROM kv").unwrap() else { panic!() };
         assert_eq!(project, Project::Exprs(vec![col("count")]));
     }
 
     #[test]
     fn a_name_can_say_its_table_and_a_table_can_have_a_short_name() {
         let s = parse("SELECT e.title, c.name FROM events e JOIN calendars AS c ON c.id = e.calendar_id WHERE e.id = 1").unwrap();
-        let Stmt::Select { alias, join, project, .. } = s else { panic!() };
+        let Stmt::Select(Select { alias, join, project, .. }) = s else { panic!() };
         assert_eq!(alias.as_deref(), Some("e"));
         let join = join.unwrap();
         assert_eq!(join.table, "calendars");
@@ -1098,7 +1349,7 @@ mod tests {
                 Expr::Column(Name { table: Some("c".into()), column: "name".into() }),
             ])
         );
-        let Stmt::Select { alias, .. } = parse("SELECT a FROM kv WHERE a = 1").unwrap() else { panic!() };
+        let Stmt::Select(Select { alias, .. }) = parse("SELECT a FROM kv WHERE a = 1").unwrap() else { panic!() };
         assert_eq!(alias, None);
         assert!(parse("SELECT x FROM a INNER JOIN b ON a.k = b.id").is_ok());
     }
@@ -1106,12 +1357,12 @@ mod tests {
     #[test]
     fn order_by_takes_a_direction_and_a_list() {
         let s = parse("SELECT a FROM kv ORDER BY a DESC, b, c ASC LIMIT 5").unwrap();
-        let Stmt::Select { order, limit, .. } = s else { panic!() };
+        let Stmt::Select(Select { order, limit, .. }) = s else { panic!() };
         assert_eq!(order.len(), 3);
         assert!(order[0].desc);
         assert!(!order[1].desc);
         assert!(!order[2].desc);
-        assert_eq!(limit, Some(5));
+        assert_eq!(limit, Some(int(5)));
     }
 
     #[test]
@@ -1164,7 +1415,10 @@ mod tests {
             "SELECT", "SELECT a FROM", "INSERT INTO kv VALUES", "WOBBLE kv",
             "SELECT a FROM kv WHERE", "SELECT a FROM kv WHERE id =", "CREATE TABLE kv (a WOBBLE)",
             "SELECT a FROM kv WHERE c = 'never closed", "SELECT a FROM kv; SELECT a FROM kv",
-            "SELECT a FROM kv LIMIT x", "SELECT a FROM kv WHERE id = ?0", "SELECT a FROM kv WHERE (a = 1",
+            "SELECT a FROM kv LIMIT", "SELECT a FROM kv WHERE id = ?0", "SELECT a FROM kv WHERE (a = 1",
+            "SELECT a FROM kv WHERE a IN 1", "SELECT a FROM kv WHERE a IN (1", "SELECT a FROM kv GROUP a",
+            "SELECT CASE END FROM kv", "SELECT CASE WHEN 1 THEN 2 FROM kv", "SELECT substr(c) FROM kv",
+            "SELECT a FROM kv WHERE a IN (SELECT a FROM kv", "SELECT a FROM kv WHERE c LIKE", "ALTER TABLE kv",
             "SELECT NOPE(a) FROM kv", "INSERT OR WOBBLE INTO kv (a) VALUES (1)",
             "CREATE TABLE kv (a INTEGER DEFAULT b)",
         ] {
@@ -1175,5 +1429,80 @@ mod tests {
     #[test]
     fn a_trailing_semicolon_is_fine() {
         assert!(parse("SELECT a FROM kv;").is_ok());
+    }
+
+    #[test]
+    fn a_select_can_group_page_and_drop_repeats() {
+        let Stmt::Select(q) = parse(
+            "SELECT DISTINCT folder, COUNT(*) AS cnt, a total FROM m GROUP BY folder, 3 \
+             ORDER BY cnt DESC LIMIT ?1 OFFSET ?2",
+        )
+        .unwrap() else {
+            panic!()
+        };
+        assert!(q.distinct);
+        assert_eq!(q.names, vec![None, Some("cnt".to_string()), Some("total".to_string())]);
+        assert_eq!(q.group, vec![col("folder"), int(3)]);
+        assert_eq!(q.limit, Some(Expr::Param(0)));
+        assert_eq!(q.offset, Some(Expr::Param(1)));
+        assert_eq!(q.params(), 2);
+    }
+
+    #[test]
+    fn like_in_case_and_functions_are_read() {
+        let text = |s: &str| Expr::Lit(Value::Text(s.to_string()));
+        assert_eq!(
+            filter_of("SELECT a FROM kv WHERE c NOT LIKE 'x%'"),
+            Expr::Like { what: Box::new(col("c")), pattern: Box::new(text("x%")), not: true }
+        );
+        assert_eq!(
+            filter_of("SELECT a FROM kv WHERE a IN (1, ?1)"),
+            Expr::In { what: Box::new(col("a")), list: vec![int(1), Expr::Param(0)], not: false }
+        );
+        assert_eq!(
+            filter_of("SELECT a FROM kv WHERE CASE WHEN a = 1 THEN 2 ELSE 3 END"),
+            Expr::Case {
+                whens: vec![(bin(col("a"), Op::Cmp(Cmp::Eq), int(1)), int(2))],
+                otherwise: Some(Box::new(int(3))),
+            }
+        );
+        // The short form asks the same thing as the long one.
+        assert_eq!(
+            filter_of("SELECT a FROM kv WHERE CASE a WHEN 1 THEN 2 WHEN 3 THEN 4 END"),
+            filter_of("SELECT a FROM kv WHERE CASE WHEN a = 1 THEN 2 WHEN a = 3 THEN 4 END")
+        );
+        assert_eq!(
+            filter_of("SELECT a FROM kv WHERE substr(c, 1, 2) = 'ab'"),
+            bin(Expr::Call(Scalar::Substr, vec![col("c"), int(1), int(2)]), Op::Cmp(Cmp::Eq), text("ab"))
+        );
+    }
+
+    #[test]
+    fn a_query_inside_another_shares_the_slots() {
+        let s = parse(
+            "SELECT a FROM kv WHERE a = ?1 AND id IN (SELECT ref FROM u WHERE tag = ?2) \
+             AND b > (SELECT MAX(b) FROM kv) - ?3",
+        )
+        .unwrap();
+        assert!(s.has_query());
+        assert_eq!(s.params(), 3);
+        assert!(!parse("SELECT a FROM kv WHERE a IN (1, 2)").unwrap().has_query());
+        assert!(parse("DELETE FROM kv WHERE id IN (SELECT ref FROM u)").unwrap().has_query());
+    }
+
+    #[test]
+    fn alter_table_adds_one_column() {
+        let Stmt::AddColumn { table, column } =
+            parse("ALTER TABLE kv ADD COLUMN n INTEGER NOT NULL DEFAULT 5").unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!((table.as_str(), column.name.as_str(), column.kind), ("kv", "n", Kind::Int));
+        assert!(!column.null_ok);
+        assert_eq!(column.default, Some(Value::Int(5)));
+        assert!(parse("ALTER TABLE kv ADD n TEXT").is_ok());
+        assert!(parse("ALTER TABLE kv ADD COLUMN n INTEGER PRIMARY KEY").is_err());
+        assert!(parse("ALTER TABLE kv ADD COLUMN n INTEGER UNIQUE").is_err());
+        assert!(parse("ALTER TABLE kv DROP COLUMN n").is_err());
     }
 }

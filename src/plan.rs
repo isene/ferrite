@@ -9,10 +9,12 @@
 //! phase 2 gate measures: a prepared lookup by key has to cost within
 //! 10% of calling [`crate::Table::get_at`] directly.
 
+use std::borrow::Cow;
 use std::cmp::Ordering;
+use std::collections::{BTreeMap, BTreeSet};
 
-use crate::sql::{self, Cmp, ColDef, Expr, Func, Name, OnConflict, Op, Project, Stmt};
-use crate::{Column, Db, Error, ForeignKey, IndexId, Result, Row, SortKey, TableId, Value};
+use crate::sql::{self, Cmp, ColDef, Expr, Func, Name, OnConflict, Op, Project, Scalar, Select, Stmt};
+use crate::{func, Column, Db, Error, ForeignKey, IndexId, Result, Row, SortKey, TableId, Value};
 
 /// Where a value comes from: which of the tables the query names, and
 /// either the key a row is filed under or one of its stored columns.
@@ -49,38 +51,79 @@ enum E {
     Coalesce(Vec<E>),
     /// The n-th aggregate of the statement, once it has been worked out.
     Agg(usize),
+    In { what: Box<E>, list: Vec<E>, not: bool },
+    Like { what: Box<E>, pattern: Box<E>, not: bool },
+    Case { whens: Vec<(E, E)>, otherwise: Option<Box<E>> },
+    Call(Scalar, Vec<E>),
 }
 
 impl E {
+    /// Call `f` on this expression and on every one inside it.
+    fn walk<'a>(&'a self, f: &mut dyn FnMut(&'a E)) {
+        f(self);
+        match self {
+            E::Lit(_) | E::Param(_) | E::Pick(_) | E::Agg(_) => {}
+            E::Not(e) | E::IsNull(e, _) => e.walk(f),
+            E::Between { what, low, high, .. } => {
+                what.walk(f);
+                low.walk(f);
+                high.walk(f);
+            }
+            E::Bin(a, _, b) | E::Like { what: a, pattern: b, .. } => {
+                a.walk(f);
+                b.walk(f);
+            }
+            E::Coalesce(v) | E::Call(_, v) => v.iter().for_each(|e| e.walk(f)),
+            E::In { what, list, .. } => {
+                what.walk(f);
+                list.iter().for_each(|e| e.walk(f));
+            }
+            E::Case { whens, otherwise } => {
+                for (when, then) in whens {
+                    when.walk(f);
+                    then.walk(f);
+                }
+                if let Some(e) = otherwise { e.walk(f); }
+            }
+        }
+    }
+
     /// The furthest table this reaches into: 0 for the first, 1 for the
     /// joined one, 0 as well for something that needs no row at all.
     fn side(&self) -> u8 {
-        match self {
-            E::Pick(p) => p.side(),
-            E::Lit(_) | E::Param(_) | E::Agg(_) => 0,
-            E::Not(e) | E::IsNull(e, _) => e.side(),
-            E::Between { what, low, high, .. } => what.side().max(low.side()).max(high.side()),
-            E::Bin(a, _, b) => a.side().max(b.side()),
-            E::Coalesce(v) => v.iter().map(E::side).max().unwrap_or(0),
-        }
+        let mut side = 0;
+        self.walk(&mut |e| {
+            if let E::Pick(p) = e { side = side.max(p.side()); }
+        });
+        side
     }
 
     fn needs_row(&self) -> bool {
-        match self {
-            E::Pick(_) => true,
-            E::Lit(_) | E::Param(_) | E::Agg(_) => false,
-            E::Not(e) | E::IsNull(e, _) => e.needs_row(),
-            E::Between { what, low, high, .. } => what.needs_row() || low.needs_row() || high.needs_row(),
-            E::Bin(a, _, b) => a.needs_row() || b.needs_row(),
-            E::Coalesce(v) => v.iter().any(E::needs_row),
-        }
+        let mut found = false;
+        self.walk(&mut |e| found |= matches!(e, E::Pick(_)));
+        found
+    }
+
+    fn has_aggregate(&self) -> bool {
+        let mut found = false;
+        self.walk(&mut |e| found |= matches!(e, E::Agg(_)));
+        found
     }
 }
 
-fn arg_of(e: &Expr) -> Option<Arg> {
+/// A value known without looking at any row. A sum of written-in
+/// numbers, like `100 - 5`, is worked out here when it comes to a whole
+/// number, so that it can still find rows by key or through an index.
+fn arg_of(scope: &Scope, e: &Expr) -> Option<Arg> {
     match e {
         Expr::Lit(v) => Some(Arg::Lit(v.clone())),
         Expr::Param(n) => Some(Arg::Param(*n)),
+        Expr::Bin(..) if e.is_constant() => {
+            match scope.resolve(e, &mut None).and_then(|e| eval(&e, &[], &[], &[])) {
+                Ok(v @ Value::Int(_)) => Some(Arg::Lit(v)),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
@@ -152,7 +195,7 @@ struct Sort {
     desc: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 struct Counting {
     func: Func,
     /// What it is over. `COUNT(*)` has nothing.
@@ -165,9 +208,11 @@ enum What {
     Row(Vec<Pick>),
     /// A select list with something to work out in it.
     Exprs(Vec<E>),
-    /// A select list with aggregates in it, which gives one row back.
-    /// `needs_row` is true when a plain column sits beside them, which
-    /// SQL answers from the last row seen.
+    /// A select list with aggregates in it, or one under a GROUP BY. It
+    /// gives one row back, or one for each group. `needs_row` is true
+    /// when a plain column sits beside the aggregates. Without a GROUP
+    /// BY that is answered from the last row seen, and with one from the
+    /// first row of each group.
     Aggs { items: Vec<E>, aggs: Vec<Counting>, needs_row: bool },
 }
 
@@ -212,9 +257,20 @@ enum Plan {
         join: Option<Joined>,
         what: What,
         filter: Where,
+        /// `SELECT DISTINCT`: no row comes back twice.
+        distinct: bool,
+        group: Vec<E>,
         order: Vec<Sort>,
-        limit: Option<usize>,
+        /// Worked out when the statement runs, since either can be a
+        /// `?` slot.
+        limit: Option<E>,
+        offset: Option<E>,
     },
+    /// A statement with a query inside it. The query inside is answered
+    /// when the statement runs, and the rest is planned around its
+    /// answer then.
+    Later { stmt: Box<Stmt>, reads: bool },
+    AddColumn { table: TableId, column: Column },
     /// `from_row` is true when a new value is worked out from the row
     /// itself, as in `SET a = a + 1`, so the row has to be fetched.
     Update { table: TableId, sets: Vec<(usize, E)>, filter: Where, from_row: bool },
@@ -323,11 +379,7 @@ impl Scope<'_> {
             Expr::Bin(a, op, b) => {
                 E::Bin(Box::new(self.resolve(a, aggs)?), *op, Box::new(self.resolve(b, aggs)?))
             }
-            Expr::Coalesce(v) => {
-                let mut out = Vec::with_capacity(v.len());
-                for x in v { out.push(self.resolve(x, aggs)?); }
-                E::Coalesce(out)
-            }
+            Expr::Coalesce(v) => E::Coalesce(self.resolve_all(v, aggs)?),
             Expr::Agg(func, arg) => {
                 let arg = match arg {
                     Some(x) => Some(self.resolve(x, &mut None)?),
@@ -336,10 +388,79 @@ impl Scope<'_> {
                 let Some(list) = aggs else {
                     return Err(err("an aggregate can only be in the select list"));
                 };
-                list.push(Counting { func: *func, arg });
-                E::Agg(list.len() - 1)
+                // The same aggregate written twice is worked out once.
+                let counting = Counting { func: *func, arg };
+                E::Agg(match list.iter().position(|c| *c == counting) {
+                    Some(i) => i,
+                    None => {
+                        list.push(counting);
+                        list.len() - 1
+                    }
+                })
+            }
+            Expr::In { what, list, not } => E::In {
+                what: Box::new(self.resolve(what, aggs)?),
+                list: self.resolve_all(list, aggs)?,
+                not: *not,
+            },
+            Expr::Like { what, pattern, not } => E::Like {
+                what: Box::new(self.resolve(what, aggs)?),
+                pattern: Box::new(self.resolve(pattern, aggs)?),
+                not: *not,
+            },
+            Expr::Case { whens, otherwise } => {
+                let mut out = Vec::with_capacity(whens.len());
+                for (when, then) in whens {
+                    out.push((self.resolve(when, aggs)?, self.resolve(then, aggs)?));
+                }
+                let otherwise = match otherwise {
+                    Some(x) => Some(Box::new(self.resolve(x, aggs)?)),
+                    None => None,
+                };
+                E::Case { whens: out, otherwise }
+            }
+            Expr::Call(f, args) => E::Call(*f, self.resolve_all(args, aggs)?),
+            Expr::Query(_) | Expr::InQuery { .. } => {
+                return Err(err("a query inside another is answered before this one is planned"));
             }
         })
+    }
+
+    fn resolve_all(&self, v: &[Expr], aggs: &mut Option<&mut Vec<Counting>>) -> Result<Vec<E>> {
+        let mut out = Vec::with_capacity(v.len());
+        for x in v { out.push(self.resolve(x, aggs)?); }
+        Ok(out)
+    }
+
+    /// A term of ORDER BY or GROUP BY. It can name an item of the select
+    /// list, by the name the item was given or by its number, and then
+    /// it means that item. GROUP BY looks for a real column of that name
+    /// first, and ORDER BY for a named item first, as SQLite does.
+    fn term(
+        &self,
+        e: &Expr,
+        items: &[E],
+        names: &[Option<String>],
+        column_first: bool,
+        aggs: &mut Option<&mut Vec<Counting>>,
+    ) -> Result<E> {
+        match e {
+            Expr::Lit(Value::Int(n)) => {
+                return usize::try_from(*n)
+                    .ok()
+                    .and_then(|n| items.get(n.wrapping_sub(1)))
+                    .cloned()
+                    .ok_or_else(|| err(&format!("the select list has no column number {n}")));
+            }
+            Expr::Column(n) if n.table.is_none() && !(column_first && self.pick(n).is_ok()) => {
+                let named = names
+                    .iter()
+                    .position(|a| a.as_ref().is_some_and(|a| a.eq_ignore_ascii_case(&n.column)));
+                if let Some(i) = named { return Ok(items[i].clone()); }
+            }
+            _ => {}
+        }
+        self.resolve(e, aggs)
     }
 }
 
@@ -349,7 +470,27 @@ impl Scope<'_> {
 pub fn plan(db: &Db, sql: &str) -> Result<Statement> {
     let stmt = sql::parse(sql)?;
     let params = stmt.params();
-    let plan = match stmt {
+    if stmt.has_query() {
+        // A query inside another is answered when the statement runs,
+        // and the rest is planned around its answer then. What can be
+        // checked now is checked now: with an empty answer standing in,
+        // every name still has to be there.
+        let mut probe = stmt.clone();
+        for e in probe.exprs_mut() {
+            e.settle(&mut |inner| check_inner(db, inner).map(|()| Vec::new()))?;
+        }
+        planned(db, probe)?;
+        let reads = matches!(stmt, Stmt::Select(_));
+        return Ok(Statement { plan: Plan::Later { stmt: Box::new(stmt), reads }, params, fast: None });
+    }
+    let plan = planned(db, stmt)?;
+    let fast = fast_path(&plan);
+    Ok(Statement { plan, params, fast })
+}
+
+/// Plan a statement that has no query inside it.
+fn planned(db: &Db, stmt: Stmt) -> Result<Plan> {
+    Ok(match stmt {
         Stmt::Begin => Plan::Begin,
         Stmt::Commit => Plan::Commit,
         Stmt::Rollback => Plan::Rollback,
@@ -370,27 +511,91 @@ pub fn plan(db: &Db, sql: &str) -> Result<Statement> {
             Plan::CreateIndex { name, table, columns, unique, if_missing }
         }
         Stmt::DropIndex { name, if_there } => Plan::DropIndex { name, if_there },
+        Stmt::AddColumn { table, column } => Plan::AddColumn {
+            table: db.table_id(&table)?,
+            column: Column {
+                name: column.name,
+                kind: column.kind,
+                null_ok: column.null_ok,
+                default: column.default.unwrap_or(Value::Null),
+            },
+        },
         Stmt::Insert { table, columns, values, on_conflict } => {
             insert(db, table, columns, values, on_conflict)?
         }
-        Stmt::Select { table, alias, join, project, filter, order, limit } => {
-            select(db, table, alias, join, project, filter, order, limit)?
-        }
+        Stmt::Select(q) => select(db, q)?,
         Stmt::Update { table, sets, filter } => update(db, table, sets, filter)?,
         Stmt::Delete { table, filter } => delete(db, table, filter)?,
-    };
-    let fast = fast_path(&plan);
-    Ok(Statement { plan, params, fast })
+    })
+}
+
+/// Check a query that sits inside another, without running it. Its
+/// names have to be there, and it has to give one column back.
+fn check_inner(db: &Db, q: &Select) -> Result<()> {
+    let mut q = q.clone();
+    for e in q.exprs_mut() {
+        e.settle(&mut |inner| check_inner(db, inner).map(|()| Vec::new()))?;
+    }
+    if let Plan::Select { what, .. } = select(db, q)? {
+        let columns = match &what {
+            What::Row(picks) => picks.len(),
+            What::Exprs(items) | What::Aggs { items, .. } => items.len(),
+        };
+        if columns != 1 {
+            return Err(err("a query inside another gives one column back"));
+        }
+    }
+    Ok(())
+}
+
+/// The first column of every row a query inside another comes back
+/// with.
+fn answer(db: &Db, q: &Select, params: &[Value]) -> Result<Vec<Value>> {
+    let mut q = q.clone();
+    for e in q.exprs_mut() {
+        e.settle(&mut |inner| answer(db, inner, params))?;
+    }
+    let inner = Statement { plan: select(db, q)?, params: 0, fast: None };
+    Ok(match inner.query(db, params)? {
+        Outcome::Rows(rows) => rows.into_iter().filter_map(|row| row.into_iter().next()).collect(),
+        _ => Vec::new(),
+    })
+}
+
+/// Answer the queries inside a statement, and plan what is left.
+fn settled(db: &Db, stmt: &Stmt, params: &[Value]) -> Result<Plan> {
+    let mut stmt = stmt.clone();
+    for e in stmt.exprs_mut() {
+        e.settle(&mut |inner| answer(db, inner, params))?;
+    }
+    planned(db, stmt)
 }
 
 /// Recognise `SELECT one_stored_column FROM t WHERE key = x` with
 /// nothing else to check.
 fn fast_path(plan: &Plan) -> Option<Fast> {
-    let Plan::Select { table, join: None, what: What::Row(picks), filter, order, limit } = plan
+    let Plan::Select {
+        table,
+        join: None,
+        what: What::Row(picks),
+        filter,
+        distinct: false,
+        order,
+        limit,
+        offset: None,
+        ..
+    } = plan
     else {
         return None;
     };
-    if picks.len() != 1 || !filter.is_plain() || !order.is_empty() || matches!(limit, Some(0)) {
+    // A LIMIT written as a number other than zero cannot hide the one
+    // row. Any other LIMIT is only known when the statement runs.
+    let shows_a_row = match limit {
+        None => true,
+        Some(E::Lit(Value::Int(n))) => *n != 0,
+        Some(_) => false,
+    };
+    if picks.len() != 1 || !filter.is_plain() || !order.is_empty() || !shows_a_row {
         return None;
     }
     let Pick::Col(0, col) = picks[0] else { return None };
@@ -516,17 +721,8 @@ fn insert(
     Ok(Plan::Insert { table: id, key, values, on_conflict })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn select(
-    db: &Db,
-    table: String,
-    alias: Option<String>,
-    join: Option<sql::Join>,
-    project: Project,
-    filter: Option<Expr>,
-    order: Vec<sql::Order>,
-    limit: Option<usize>,
-) -> Result<Plan> {
+fn select(db: &Db, q: Select) -> Result<Plan> {
+    let Select { table, alias, join, distinct, project, names, filter, group, order, limit, offset } = q;
     let id = db.table_id(&table)?;
     let mut scope = Scope { db, sides: vec![Side { table: table.clone(), alias, id }] };
     let mut extra: Vec<Expr> = Vec::new();
@@ -571,46 +767,60 @@ fn select(
         }
     }
 
-    let what = match project {
-        Project::All => What::Row(
-            scope
-                .sides
-                .iter()
-                .enumerate()
-                .flat_map(|(side, s)| {
-                    let t = db.table(s.id);
-                    // A hidden rowid is not a column anyone asked for.
-                    let key = if t.key_name() == "rowid" { None } else { Some(Pick::Key(side as u8)) };
-                    let n = t.columns().len();
-                    key.into_iter().chain((0..n).map(move |i| Pick::Col(side as u8, i)))
-                })
-                .collect(),
-        ),
-        Project::Exprs(exprs) => {
-            let mut aggs = Vec::new();
-            let mut items = Vec::with_capacity(exprs.len());
-            for e in &exprs {
-                items.push(scope.resolve(e, &mut Some(&mut aggs))?);
-            }
-            let picks: Option<Vec<Pick>> =
-                items.iter().map(|e| if let E::Pick(p) = e { Some(*p) } else { None }).collect();
-            if !aggs.is_empty() {
-                let needs_row = items.iter().any(E::needs_row);
-                What::Aggs { items, aggs, needs_row }
-            } else if let Some(picks) = picks {
-                What::Row(picks)
-            } else {
-                What::Exprs(items)
-            }
+    let mut aggs = Vec::new();
+    let items: Vec<E> = match &project {
+        Project::All => scope
+            .sides
+            .iter()
+            .enumerate()
+            .flat_map(|(side, s)| {
+                let t = db.table(s.id);
+                // A hidden rowid is not a column anyone asked for.
+                let key = if t.key_name() == "rowid" { None } else { Some(Pick::Key(side as u8)) };
+                let n = t.columns().len();
+                key.into_iter().chain((0..n).map(move |i| Pick::Col(side as u8, i)))
+            })
+            .map(E::Pick)
+            .collect(),
+        Project::Exprs(exprs) => scope.resolve_all(exprs, &mut Some(&mut aggs))?,
+    };
+
+    let mut groups = Vec::with_capacity(group.len());
+    for g in &group {
+        let e = scope.term(g, &items, &names, true, &mut None)?;
+        if e.has_aggregate() {
+            return Err(err("GROUP BY cannot be an aggregate"));
+        }
+        groups.push(e);
+    }
+    // With aggregates or a GROUP BY the rows are added up, and then an
+    // ORDER BY can sort by an aggregate too.
+    let adds_up = !aggs.is_empty() || !groups.is_empty();
+    let mut sorts = Vec::with_capacity(order.len());
+    for o in &order {
+        let mut allowed = if adds_up { Some(&mut aggs) } else { None };
+        sorts.push(Sort { expr: scope.term(&o.expr, &items, &names, false, &mut allowed)?, desc: o.desc });
+    }
+
+    let what = if adds_up {
+        let needs_row = items.iter().any(E::needs_row);
+        What::Aggs { items, aggs, needs_row }
+    } else {
+        let picks: Option<Vec<Pick>> =
+            items.iter().map(|e| if let E::Pick(p) = e { Some(*p) } else { None }).collect();
+        match picks {
+            Some(picks) => What::Row(picks),
+            None => What::Exprs(items),
         }
     };
 
     let filter = where_of(db, &scope, filter, extra)?;
-    let mut sorts = Vec::with_capacity(order.len());
-    for o in &order {
-        sorts.push(Sort { expr: scope.resolve(&o.expr, &mut None)?, desc: o.desc });
-    }
-    Ok(Plan::Select { table: id, join: joined, what, filter, order: sorts, limit })
+    // A LIMIT or an OFFSET is a number or a `?` slot. No column of any
+    // table can be named in one.
+    let no_table = Scope { db, sides: Vec::new() };
+    let limit = limit.map(|e| no_table.resolve(&e, &mut None)).transpose()?;
+    let offset = offset.map(|e| no_table.resolve(&e, &mut None)).transpose()?;
+    Ok(Plan::Select { table: id, join: joined, what, filter, distinct, group: groups, order: sorts, limit, offset })
 }
 
 fn update(db: &Db, table: String, sets: Vec<(String, Expr)>, filter: Option<Expr>) -> Result<Plan> {
@@ -649,17 +859,19 @@ fn where_of(db: &Db, scope: &Scope, filter: Option<Expr>, extra: Vec<Expr>) -> R
     for part in parts {
         match &part {
             Expr::Bin(a, Op::Cmp(c), b) => {
-                if let (Expr::Column(n), Some(arg)) = (a.as_ref(), arg_of(b)) {
+                if let (Expr::Column(n), Some(arg)) = (a.as_ref(), arg_of(scope, b)) {
                     simple.push((scope.pick(n)?, *c, arg));
                     continue;
                 }
-                if let (Some(arg), Expr::Column(n)) = (arg_of(a), b.as_ref()) {
+                if let (Some(arg), Expr::Column(n)) = (arg_of(scope, a), b.as_ref()) {
                     simple.push((scope.pick(n)?, c.flipped(), arg));
                     continue;
                 }
             }
             Expr::Between { what, low, high, not: false } => {
-                if let (Expr::Column(n), Some(lo), Some(hi)) = (what.as_ref(), arg_of(low), arg_of(high)) {
+                if let (Expr::Column(n), Some(lo), Some(hi)) =
+                    (what.as_ref(), arg_of(scope, low), arg_of(scope, high))
+                {
                     let p = scope.pick(n)?;
                     simple.push((p, Cmp::Ge, lo));
                     simple.push((p, Cmp::Le, hi));
@@ -847,11 +1059,26 @@ fn arithmetic(a: &Value, op: Op, b: &Value) -> Value {
 /// One row of the query: the key and row of each table it names.
 type Sides<'a> = [(i64, &'a Row)];
 
-fn take(pick: Pick, sides: &Sides) -> Value {
+fn pick_of(pick: Pick, sides: &Sides) -> Value {
     match pick {
         Pick::Key(s) => sides.get(s as usize).map_or(Value::Null, |(k, _)| Value::Int(*k)),
         Pick::Col(s, i) => sides.get(s as usize).map_or(Value::Null, |(_, r)| r[i].clone()),
     }
+}
+
+/// The value of an expression, without copying it where it is a stored
+/// column, a written-in value or a `?` slot. LIKE, IN and the functions
+/// only look at a value, and a long text is not copied for that.
+fn look<'a>(e: &'a E, sides: &Sides<'a>, params: &'a [Value], aggs: &[Value]) -> Result<Cow<'a, Value>> {
+    Ok(match e {
+        E::Lit(v) => Cow::Borrowed(v),
+        E::Param(n) => Cow::Borrowed(params.get(*n).ok_or_else(|| err("a value is missing"))?),
+        E::Pick(Pick::Col(s, i)) => match sides.get(*s as usize) {
+            Some((_, row)) => Cow::Borrowed(&row[*i]),
+            None => Cow::Owned(Value::Null),
+        },
+        _ => Cow::Owned(eval(e, sides, params, aggs)?),
+    })
 }
 
 /// Work an expression out against a row.
@@ -859,7 +1086,7 @@ fn eval(e: &E, sides: &Sides, params: &[Value], aggs: &[Value]) -> Result<Value>
     Ok(match e {
         E::Lit(v) => v.clone(),
         E::Param(n) => params.get(*n).cloned().ok_or_else(|| err("a value is missing"))?,
-        E::Pick(p) => take(*p, sides),
+        E::Pick(p) => pick_of(*p, sides),
         E::Agg(i) => aggs.get(*i).cloned().unwrap_or(Value::Null),
         E::Not(x) => from_truth(truth(&eval(x, sides, params, aggs)?).map(|b| !b)),
         E::IsNull(x, not) => Value::Int(((eval(x, sides, params, aggs)? == Value::Null) != *not) as i64),
@@ -896,7 +1123,64 @@ fn eval(e: &E, sides: &Sides, params: &[Value], aggs: &[Value]) -> Result<Value>
                 _ => arithmetic(&a, *op, &eval(b, sides, params, aggs)?),
             }
         }
+        E::In { what, list, not } => {
+            // False until one of the list is equal. A null on either
+            // side leaves it unknown, unless one is equal after all.
+            let w = look(what, sides, params, aggs)?;
+            let mut found = Some(false);
+            for item in list {
+                match compare(&w, &*look(item, sides, params, aggs)?, Cmp::Eq) {
+                    Some(true) => {
+                        found = Some(true);
+                        break;
+                    }
+                    Some(false) => {}
+                    None => found = None,
+                }
+            }
+            from_truth(if *not { found.map(|b| !b) } else { found })
+        }
+        E::Like { what, pattern, not } => {
+            let w = look(what, sides, params, aggs)?;
+            let p = look(pattern, sides, params, aggs)?;
+            match (func::text(&w), func::text(&p)) {
+                (Some(text), Some(pattern)) => Value::Int((func::like(&pattern, &text) != *not) as i64),
+                _ => Value::Null,
+            }
+        }
+        E::Case { whens, otherwise } => {
+            for (when, then) in whens {
+                if truth(&eval(when, sides, params, aggs)?) == Some(true) {
+                    return eval(then, sides, params, aggs);
+                }
+            }
+            match otherwise {
+                Some(x) => eval(x, sides, params, aggs)?,
+                None => Value::Null,
+            }
+        }
+        E::Call(f, args) => {
+            // No function takes more than three values, so they sit in
+            // an array and nothing is set aside for them.
+            let mut values = [Cow::Owned(Value::Null), Cow::Owned(Value::Null), Cow::Owned(Value::Null)];
+            for (slot, arg) in values.iter_mut().zip(args) {
+                *slot = look(arg, sides, params, aggs)?;
+            }
+            func::call(*f, &values[..args.len().min(3)])?
+        }
     })
+}
+
+/// A value that needs no row to work out, which is what an INSERT
+/// stores. Nearly always it is a `?` slot or written into the
+/// statement, and then it is read straight out.
+#[inline]
+fn alone(e: &E, params: &[Value]) -> Result<Value> {
+    match e {
+        E::Param(n) => params.get(*n).cloned().ok_or_else(|| err("a value is missing")),
+        E::Lit(v) => Ok(v.clone()),
+        _ => eval(e, &[], params, &[]),
+    }
 }
 
 fn and3(a: Option<bool>, b: Option<bool>) -> Option<bool> {
@@ -923,7 +1207,7 @@ fn passes(tests: &[Test], sides: &Sides, params: &[Value]) -> Result<bool> {
         let left = match t.pick {
             Pick::Col(s, i) => &sides[s as usize].1[i],
             Pick::Key(_) => {
-                held = take(t.pick, sides);
+                held = pick_of(t.pick, sides);
                 &held
             }
         };
@@ -967,7 +1251,7 @@ impl Statement {
     /// Whether this one reads or changes something.
     pub fn kind(&self) -> Kind2 {
         match self.plan {
-            Plan::Select { .. } => Kind2::Reads,
+            Plan::Select { .. } | Plan::Later { reads: true, .. } => Kind2::Reads,
             _ => Kind2::Changes,
         }
     }
@@ -989,7 +1273,10 @@ impl Statement {
         };
         let key = match value_of(&fast.key, params)? {
             Value::Int(i) => *i,
-            _ => return Ok(None),
+            other => match key_of(other) {
+                Some(key) => key,
+                None => return Ok(None),
+            },
         };
         Ok(db.table(fast.table).get_at(key, fast.col))
     }
@@ -997,11 +1284,22 @@ impl Statement {
     /// Run a statement that reads.
     pub fn query(&self, db: &Db, params: &[Value]) -> Result<Outcome> {
         self.check(params)?;
-        let Plan::Select { table, join, what, filter, order, limit } = &self.plan else {
+        if let Plan::Later { stmt, reads: true } = &self.plan {
+            return self.settled(db, stmt, params)?.query(db, params);
+        }
+        let Plan::Select { table, join, what, filter, distinct, group, order, limit, offset } = &self.plan
+        else {
             return Err(err("this statement changes things; use run"));
         };
+        let (skip, take) = window(limit, offset, params)?;
         match what {
+            What::Aggs { items, aggs, .. } if !group.is_empty() => Ok(Outcome::Rows(grouped(
+                db, *table, join, filter, group, items, aggs, order, *distinct, skip, take, params,
+            )?)),
             What::Aggs { items, aggs, needs_row } => {
+                // An aggregate gives one row back. A LIMIT or an OFFSET
+                // can only hide it, never cut the counting short.
+                let hidden = take == 0 || skip > 0;
                 // `COUNT(*)` with nothing else to check never needs the
                 // rows themselves. The table knows how many it holds,
                 // and an index knows how many hold a given value.
@@ -1012,7 +1310,7 @@ impl Statement {
                     && aggs.iter().all(|a| a.func == Func::Count && a.arg.is_none())
                 {
                     if let Some(n) = counted_without_rows(db, *table, filter, params)? {
-                        if limit == &Some(0) { return Ok(Outcome::Rows(Vec::new())); }
+                        if hidden { return Ok(Outcome::Rows(Vec::new())); }
                         let counts = vec![Value::Int(n); aggs.len()];
                         let row = items.iter().map(|e| eval(e, &[], params, &counts)).collect::<Result<Row>>()?;
                         return Ok(Outcome::Rows(vec![row]));
@@ -1033,9 +1331,7 @@ impl Statement {
                     }
                     Ok(true)
                 })?;
-                // An aggregate gives one row back, and a LIMIT can only
-                // hide it, never cut the counting short.
-                if limit == &Some(0) {
+                if hidden {
                     return Ok(Outcome::Rows(Vec::new()));
                 }
                 let done: Vec<Value> = state.iter().map(AggState::finish).collect();
@@ -1048,16 +1344,18 @@ impl Statement {
                 // index, is already answered by the index: it holds the
                 // keys. Fetching each row to read back the key it was
                 // filed under is a walk down the row tree for nothing.
-                if let Some(rows) = keys_from_index(db, join, picks, filter, order, *limit, params)? {
-                    return Ok(Outcome::Rows(rows));
+                if !*distinct {
+                    if let Some(rows) = keys_from_index(db, join, picks, filter, order, skip, take, params)? {
+                        return Ok(Outcome::Rows(rows));
+                    }
                 }
-                let rows = collect(db, *table, join, filter, order, *limit, params, |sides| {
-                    Ok(picks.iter().map(|p| take(*p, sides)).collect())
+                let rows = collect(db, *table, join, filter, order, *distinct, skip, take, params, |sides| {
+                    Ok(picks.iter().map(|p| pick_of(*p, sides)).collect())
                 })?;
                 Ok(Outcome::Rows(rows))
             }
             What::Exprs(items) => {
-                let rows = collect(db, *table, join, filter, order, *limit, params, |sides| {
+                let rows = collect(db, *table, join, filter, order, *distinct, skip, take, params, |sides| {
                     items.iter().map(|e| eval(e, sides, params, &[])).collect()
                 })?;
                 Ok(Outcome::Rows(rows))
@@ -1135,7 +1433,7 @@ impl Statement {
 
             Plan::Insert { table, key, values, on_conflict } => {
                 let key = match key {
-                    Some(e) => match eval(e, &[], params, &[])? {
+                    Some(e) => match alone(e, params)? {
                         Value::Int(i) => i,
                         Value::Null => db.next_key(*table),
                         other => {
@@ -1147,10 +1445,7 @@ impl Statement {
                     },
                     None => db.next_key(*table),
                 };
-                let row: Row = values
-                    .iter()
-                    .map(|e| eval(e, &[], params, &[]))
-                    .collect::<Result<Row>>()?;
+                let row: Row = values.iter().map(|e| alone(e, params)).collect::<Result<Row>>()?;
                 match on_conflict {
                     OnConflict::Fail => {}
                     OnConflict::Ignore => {
@@ -1221,6 +1516,13 @@ impl Statement {
                 }
             }
 
+            Plan::AddColumn { table, column } => {
+                db.add_column(*table, column.clone())?;
+                Ok(Outcome::Done)
+            }
+
+            Plan::Later { stmt, .. } => self.settled(db, stmt, params)?.run(db, params),
+
             Plan::Select { .. } => Err(err("this statement reads; use query")),
         }
     }
@@ -1239,6 +1541,16 @@ impl Statement {
             Ok(true)
         })?;
         Ok(keys)
+    }
+
+    /// This statement with its inner queries answered, ready to run.
+    /// It stays out of `run` and `query`, which would otherwise set room
+    /// aside for a whole second statement on every call.
+    #[cold]
+    #[inline(never)]
+    fn settled(&self, db: &Db, stmt: &Stmt, params: &[Value]) -> Result<Box<Statement>> {
+        let plan = settled(db, stmt, params)?;
+        Ok(Box::new(Statement { plan, params: self.params, fast: None }))
     }
 
     fn check(&self, params: &[Value]) -> Result<()> {
@@ -1263,6 +1575,47 @@ fn whole(db: &mut Db, change: impl FnOnce(&mut Db) -> Result<Outcome>) -> Result
     }
 }
 
+/// How many rows to step over and how many to give back after them. A
+/// LIMIT below zero is no limit, the way SQLite has it.
+fn window(limit: &Option<E>, offset: &Option<E>, params: &[Value]) -> Result<(usize, usize)> {
+    let whole = |e: &Option<E>| -> Result<Option<i64>> {
+        match e {
+            None => Ok(None),
+            Some(e) => match eval(e, &[], params, &[])? {
+                Value::Int(i) => Ok(Some(i)),
+                _ => Err(err("LIMIT and OFFSET take a whole number")),
+            },
+        }
+    };
+    let take = match whole(limit)? {
+        Some(n) if n >= 0 => n as usize,
+        _ => usize::MAX,
+    };
+    let skip = whole(offset)?.map_or(0, |n| n.max(0) as usize);
+    Ok((skip, take))
+}
+
+/// A row as something that can be told apart from another, for DISTINCT.
+fn told_apart(row: &Row) -> Vec<SortKey> { row.iter().cloned().map(SortKey).collect() }
+
+/// Put rows in the order asked for, step over the first `skip` and keep
+/// the next `take`. Each row comes with the values it is sorted by.
+fn in_order(mut rows: Vec<(Vec<SortKey>, Row)>, order: &[Sort], skip: usize, take: usize) -> Vec<Row> {
+    if !order.is_empty() {
+        rows.sort_by(|a, b| {
+            for (i, s) in order.iter().enumerate() {
+                let got = a.0[i].cmp(&b.0[i]);
+                let got = if s.desc { got.reverse() } else { got };
+                if got != Ordering::Equal {
+                    return got;
+                }
+            }
+            Ordering::Equal
+        });
+    }
+    rows.into_iter().skip(skip).take(take).map(|(_, r)| r).collect()
+}
+
 /// The rows a query gives back, made by `make` from each match, in the
 /// order asked for and cut to the limit.
 #[allow(clippy::too_many_arguments)]
@@ -1272,18 +1625,24 @@ fn collect(
     join: &Option<Joined>,
     filter: &Where,
     order: &[Sort],
-    limit: Option<usize>,
+    distinct: bool,
+    skip: usize,
+    take: usize,
     params: &[Value],
     make: impl Fn(&Sides) -> Result<Row>,
 ) -> Result<Vec<Row>> {
-    let cap = limit.unwrap_or(usize::MAX);
+    let cap = skip.saturating_add(take);
+    // The rows given back so far, when none may come back twice.
+    let mut seen = BTreeSet::new();
     if order.is_empty() {
         let mut out = Vec::new();
         visit(db, table, join, filter, params, &mut |sides| {
-            out.push(make(sides)?);
+            let row = make(sides)?;
+            if !distinct || seen.insert(told_apart(&row)) { out.push(row); }
             Ok(out.len() < cap)
         })?;
         out.truncate(cap);
+        if skip > 0 { out.drain(..skip.min(out.len())); }
         return Ok(out);
     }
     // With an ORDER BY, every matching row has to be found before any
@@ -1291,23 +1650,65 @@ fn collect(
     // done.
     let mut rows: Vec<(Vec<SortKey>, Row)> = Vec::new();
     visit(db, table, join, filter, params, &mut |sides| {
+        let row = make(sides)?;
+        if distinct && !seen.insert(told_apart(&row)) { return Ok(true); }
         let mut keys = Vec::with_capacity(order.len());
         for s in order { keys.push(SortKey(eval(&s.expr, sides, params, &[])?)); }
-        rows.push((keys, make(sides)?));
+        rows.push((keys, row));
         Ok(true)
     })?;
-    rows.sort_by(|a, b| {
-        for (i, s) in order.iter().enumerate() {
-            let got = a.0[i].cmp(&b.0[i]);
-            let got = if s.desc { got.reverse() } else { got };
-            if got != Ordering::Equal {
-                return got;
+    Ok(in_order(rows, order, skip, take))
+}
+
+/// One row for each group of a GROUP BY. A plain column beside the
+/// aggregates is read from the first row of its group.
+#[allow(clippy::too_many_arguments)]
+fn grouped(
+    db: &Db,
+    table: TableId,
+    join: &Option<Joined>,
+    filter: &Where,
+    group: &[E],
+    items: &[E],
+    aggs: &[Counting],
+    order: &[Sort],
+    distinct: bool,
+    skip: usize,
+    take: usize,
+    params: &[Value],
+) -> Result<Vec<Row>> {
+    // What each group has added up so far, and the first row it saw.
+    type Group = (Vec<AggState>, Vec<(i64, Row)>);
+    let mut groups: BTreeMap<Vec<SortKey>, Group> = BTreeMap::new();
+    visit(db, table, join, filter, params, &mut |sides| {
+        let mut key = Vec::with_capacity(group.len());
+        for g in group { key.push(SortKey(eval(g, sides, params, &[])?)); }
+        let (state, _) = groups.entry(key).or_insert_with(|| {
+            (
+                aggs.iter().map(|a| AggState::new(a.func, a.arg.is_none())).collect(),
+                sides.iter().map(|(k, r)| (*k, (*r).clone())).collect(),
+            )
+        });
+        for (s, a) in state.iter_mut().zip(aggs) {
+            match &a.arg {
+                None => s.saw_row(),
+                Some(e) => s.saw(&eval(e, sides, params, &[])?),
             }
         }
-        Ordering::Equal
-    });
-    rows.truncate(cap);
-    Ok(rows.into_iter().map(|(_, r)| r).collect())
+        Ok(true)
+    })?;
+    let mut seen = BTreeSet::new();
+    let mut rows = Vec::with_capacity(groups.len());
+    for (state, first) in groups.into_values() {
+        let done: Vec<Value> = state.iter().map(AggState::finish).collect();
+        let sides: Vec<(i64, &Row)> = first.iter().map(|(k, r)| (*k, r)).collect();
+        let row = items.iter().map(|e| eval(e, &sides, params, &done)).collect::<Result<Row>>()?;
+        if distinct && !seen.insert(told_apart(&row)) { continue; }
+        let mut keys = Vec::with_capacity(order.len());
+        for s in order { keys.push(SortKey(eval(&s.expr, &sides, params, &done)?)); }
+        rows.push((keys, row));
+    }
+    Ok(in_order(rows, order, skip, take))
 }
 
 /// The rows of a query that wants nothing but the key and finds them
@@ -1320,7 +1721,8 @@ fn keys_from_index(
     picks: &[Pick],
     filter: &Where,
     order: &[Sort],
-    limit: Option<usize>,
+    skip: usize,
+    take: usize,
     params: &[Value],
 ) -> Result<Option<Vec<Row>>> {
     if join.is_some() || !filter.is_plain() || picks.is_empty() {
@@ -1345,7 +1747,6 @@ fn keys_from_index(
     let mut out = Vec::new();
     if *value == Value::Null { return Ok(Some(out)); }
     let Some(rows) = db.index(*index).rows_for(value) else { return Ok(Some(out)) };
-    let cap = limit.unwrap_or(usize::MAX);
     let make = |key: &i64, held: &Value| -> Row {
         picks
             .iter()
@@ -1353,9 +1754,9 @@ fn keys_from_index(
             .collect()
     };
     if desc {
-        rows.iter().rev().take(cap).for_each(|(k, (_, v))| out.push(make(k, v)));
+        rows.iter().rev().skip(skip).take(take).for_each(|(k, (_, v))| out.push(make(k, v)));
     } else {
-        rows.iter().take(cap).for_each(|(k, (_, v))| out.push(make(k, v)));
+        rows.iter().skip(skip).take(take).for_each(|(k, (_, v))| out.push(make(k, v)));
     }
     Ok(Some(out))
 }
@@ -1370,9 +1771,9 @@ fn counted_without_rows(
 ) -> Result<Option<i64>> {
     Ok(Some(match &filter.find {
         Find::All => db.table(table).len() as i64,
-        Find::Key(e) => match value_of(e, params)? {
-            Value::Int(k) => db.table(table).get(*k).is_some() as i64,
-            _ => 0,
+        Find::Key(e) => match key_of(value_of(e, params)?) {
+            Some(k) => db.table(table).get(k).is_some() as i64,
+            None => 0,
         },
         Find::Index { index, args } => match values_of(args, params)? {
             None => 0,
@@ -1462,6 +1863,50 @@ impl AggState {
 
 // ── Walking the rows ───────────────────────────────────────────────────
 
+/// Past this a real number is no key at all: 2 to the power of 63.
+const PAST_EVERY_KEY: f64 = 9_223_372_036_854_775_808.0;
+
+/// The key a value names, if it names one. A real that is a whole number
+/// names the row the integer does, as it would in any other column.
+fn key_of(v: &Value) -> Option<i64> {
+    match v {
+        Value::Int(i) => Some(*i),
+        Value::Real(r) if r.fract() == 0.0 && r.abs() < PAST_EVERY_KEY => Some(*r as i64),
+        _ => None,
+    }
+}
+
+/// The first key that `key > v` or `key >= v` lets through. None when
+/// no key gets through: null answers nothing, and every number comes
+/// before every text, the way [`order`] has it.
+fn first_key(cmp: Cmp, v: &Value) -> Option<i64> {
+    match v {
+        Value::Int(i) if cmp == Cmp::Gt => i.checked_add(1),
+        Value::Int(i) => Some(*i),
+        Value::Real(r) => {
+            let at = if cmp == Cmp::Gt { r.floor() + 1.0 } else { r.ceil() };
+            // A number below every key turns into the lowest key.
+            (at < PAST_EVERY_KEY).then_some(at as i64)
+        }
+        _ => None,
+    }
+}
+
+/// The key that `key < v` or `key <= v` stops in front of. None when no
+/// key gets through.
+fn end_key(cmp: Cmp, v: &Value) -> Option<i64> {
+    match v {
+        Value::Int(i) if cmp == Cmp::Lt => Some(*i),
+        Value::Int(i) => Some(i.saturating_add(1)),
+        Value::Real(r) => {
+            let at = if cmp == Cmp::Lt { r.ceil() } else { r.floor() + 1.0 };
+            (at > -PAST_EVERY_KEY).then_some(at as i64)
+        }
+        Value::Null => None,
+        Value::Text(_) | Value::Blob(_) => Some(i64::MAX),
+    }
+}
+
 /// Walk the rows a query picks out, stopping when `each` says to.
 fn visit(
     db: &Db,
@@ -1478,7 +1923,7 @@ fn visit(
             return Ok(true);
         }
         let Some(j) = join else { return each(&one) };
-        let value = take(j.left, &one);
+        let value = pick_of(j.left, &one);
         if value == Value::Null {
             // Null matches nothing, not even another null.
             return Ok(true);
@@ -1520,10 +1965,7 @@ fn visit(
 
     match &filter.find {
         Find::Key(e) => {
-            let key = match value_of(e, params)? {
-                Value::Int(i) => *i,
-                _ => return Ok(()),
-            };
+            let Some(key) = key_of(value_of(e, params)?) else { return Ok(()) };
             if let Some(row) = t.get(key) {
                 go(key, row)?;
             }
@@ -1539,24 +1981,16 @@ fn visit(
         }
         Find::Range { low, high } => {
             let from = match low {
-                Some((Cmp::Gt, e)) => match value_of(e, params)? {
-                    Value::Int(i) => i.saturating_add(1),
-                    _ => return Ok(()),
-                },
-                Some((_, e)) => match value_of(e, params)? {
-                    Value::Int(i) => *i,
-                    _ => return Ok(()),
+                Some((cmp, e)) => match first_key(*cmp, value_of(e, params)?) {
+                    Some(key) => key,
+                    None => return Ok(()),
                 },
                 None => i64::MIN,
             };
             let to = match high {
-                Some((Cmp::Lt, e)) => match value_of(e, params)? {
-                    Value::Int(i) => *i,
-                    _ => return Ok(()),
-                },
-                Some((_, e)) => match value_of(e, params)? {
-                    Value::Int(i) => i.saturating_add(1),
-                    _ => return Ok(()),
+                Some((cmp, e)) => match end_key(*cmp, value_of(e, params)?) {
+                    Some(key) => key,
+                    None => return Ok(()),
                 },
                 None => i64::MAX,
             };
@@ -2241,5 +2675,255 @@ mod tests {
         assert_eq!(out.rows()[1], vec![Value::Int(2), Value::Null, Value::Text("y".into())]);
         let out = db.query("SELECT * FROM u WHERE rowid = 1", &[]).unwrap();
         assert_eq!(out.rows()[0], vec![Value::Int(1), Value::Text("x".into())]);
+    }
+
+    fn rows(db: &Db, sql: &str) -> Vec<Row> { db.query(sql, &[]).unwrap().rows().to_vec() }
+    fn int(i: i64) -> Value { Value::Int(i) }
+    fn text(s: &str) -> Value { Value::Text(s.to_string()) }
+    const NONE: Vec<i64> = Vec::new();
+
+    #[test]
+    fn a_key_is_found_by_a_number_that_is_not_whole() {
+        let db = kv();
+        // The key answers as any other column of numbers would.
+        for (key, plain) in [
+            ("id > 2.5", vec![3, 4, 5, 6, 7, 8, 9]),
+            ("id >= 2.5", vec![3, 4, 5, 6, 7, 8, 9]),
+            ("id > 7.0", vec![8, 9]),
+            ("id >= 7.0", vec![7, 8, 9]),
+            ("id < 2.5", vec![0, 1, 2]),
+            ("id <= 2.5", vec![0, 1, 2]),
+            ("id < 2.0", vec![0, 1]),
+            ("id <= 2.0", vec![0, 1, 2]),
+            ("id BETWEEN 1.5 AND 3.5", vec![2, 3]),
+            ("id = 2.0", vec![2]),
+            ("id = 2.5", vec![]),
+            // Every number comes before every text, and null answers nothing.
+            ("id < 'abc' AND id > 7", vec![8, 9]),
+            ("id > 'abc'", vec![]),
+            ("id > NULL", vec![]),
+            ("id < NULL", vec![]),
+        ] {
+            assert_eq!(ids(&db, &format!("SELECT id FROM kv WHERE {key}")), plain, "{key}");
+            // The same question of a plain column: a is ten times the key.
+            let same = key.replace("id", "a / 10");
+            assert_eq!(ids(&db, &format!("SELECT id FROM kv WHERE {same}")), plain, "{same}");
+        }
+        // A number too big to be a key is above every key, or below.
+        let big = Value::Real(1e30);
+        let small = Value::Real(-1e30);
+        for (sql, with, want) in [
+            ("SELECT id FROM kv WHERE id > ?1 AND id < 1.5", &small, vec![0, 1]),
+            ("SELECT id FROM kv WHERE id < ?1 AND id > 7", &big, vec![8, 9]),
+            ("SELECT id FROM kv WHERE id > ?1", &big, vec![]),
+            ("SELECT id FROM kv WHERE id < ?1", &small, vec![]),
+            ("SELECT id FROM kv WHERE id = ?1", &big, vec![]),
+        ] {
+            let got = db.query(sql, std::slice::from_ref(with)).unwrap();
+            assert_eq!(got.rows(), want.into_iter().map(|i| vec![int(i)]).collect::<Vec<Row>>(), "{sql}");
+        }
+        assert_eq!(rows(&db, "SELECT COUNT(*) FROM kv WHERE id = 3.0"), vec![vec![int(1)]]);
+        let s = db.prepare("SELECT a FROM kv WHERE id = ?1").unwrap();
+        assert_eq!(s.value(&db, &[Value::Real(4.0)]).unwrap(), Some(&int(40)));
+        assert_eq!(s.value(&db, &[Value::Real(4.5)]).unwrap(), None);
+        let s = db.prepare("SELECT id FROM kv WHERE id > ?1 AND id <= ?2").unwrap();
+        assert_eq!(s.query(&db, &[Value::Real(6.5), Value::Real(8.0)]).unwrap().rows(), &[vec![int(7)], vec![int(8)]]);
+    }
+
+    #[test]
+    fn like_and_in_pick_rows() {
+        let db = kv();
+        assert_eq!(ids(&db, "SELECT id FROM kv WHERE c LIKE 'ROW 3'"), vec![3]);
+        assert_eq!(ids(&db, "SELECT id FROM kv WHERE c LIKE '%w 1' OR c LIKE 'r_w 2'"), vec![1, 2]);
+        assert_eq!(ids(&db, "SELECT id FROM kv WHERE c NOT LIKE 'row%'"), NONE);
+        assert_eq!(ids(&db, "SELECT id FROM kv WHERE a LIKE '5%'"), vec![5]);
+        assert_eq!(ids(&db, "SELECT id FROM kv WHERE a IN (10, 30, 999)"), vec![1, 3]);
+        assert_eq!(ids(&db, "SELECT id FROM kv WHERE id NOT IN (0, 1, 2, 3, 4, 5, 6)"), vec![7, 8, 9]);
+        // A null in the list leaves NOT IN unknown for every row.
+        assert_eq!(ids(&db, "SELECT id FROM kv WHERE a IN (10, NULL)"), vec![1]);
+        assert_eq!(ids(&db, "SELECT id FROM kv WHERE a NOT IN (10, NULL)"), NONE);
+        assert_eq!(ids(&db, "SELECT id FROM kv WHERE a IN ()"), NONE);
+        assert_eq!(ids(&db, "SELECT id FROM kv WHERE a NOT IN () AND id < 2"), vec![0, 1]);
+        let s = db.prepare("SELECT id FROM kv WHERE c LIKE ?1 AND id IN (?2, ?3)").unwrap();
+        assert_eq!(s.query(&db, &[text("row%"), int(4), int(6)]).unwrap().rows(), &[vec![int(4)], vec![int(6)]]);
+    }
+
+    #[test]
+    fn case_and_the_text_functions_work_things_out() {
+        let db = kv();
+        assert_eq!(
+            rows(
+                &db,
+                "SELECT CASE WHEN a < 20 THEN 'low' WHEN a < 40 THEN 'mid' END, substr(c, 5), instr(c, 'w') \
+                 FROM kv WHERE id IN (1, 3, 5)"
+            ),
+            vec![
+                vec![text("low"), text("1"), int(3)],
+                vec![text("mid"), text("3"), int(3)],
+                vec![Value::Null, text("5"), int(3)],
+            ]
+        );
+        assert_eq!(
+            rows(
+                &db,
+                "SELECT SUM(CASE WHEN a >= 50 THEN 1 ELSE 0 END), \
+                        SUM(CASE id WHEN 2 THEN 5 WHEN 3 THEN 7 ELSE 0 END) FROM kv"
+            ),
+            vec![vec![int(5), int(12)]]
+        );
+        assert_eq!(
+            rows(&db, r#"SELECT json_extract('{"a":{"b":[1,"two"]}}', '$.a.b[1]') FROM kv WHERE id = 0"#),
+            vec![vec![text("two")]]
+        );
+        assert!(db.query("SELECT json_extract(c, '$.a') FROM kv", &[]).is_err());
+    }
+
+    #[test]
+    fn group_by_gives_one_row_for_each_group() {
+        let mut db = kv();
+        db.execute("UPDATE kv SET c = CASE WHEN id < 3 THEN 'x' WHEN id < 7 THEN 'y' ELSE 'z' END", &[])
+            .unwrap();
+        assert_eq!(
+            rows(&db, "SELECT c, COUNT(*) AS n, SUM(a) FROM kv GROUP BY c"),
+            vec![
+                vec![text("x"), int(3), int(30)],
+                vec![text("y"), int(4), int(180)],
+                vec![text("z"), int(3), int(240)],
+            ]
+        );
+        // The ORDER BY can use the name an item was given, its number,
+        // or an aggregate of its own.
+        assert_eq!(
+            rows(&db, "SELECT c, COUNT(*) AS n FROM kv GROUP BY c ORDER BY n DESC, c DESC"),
+            vec![vec![text("y"), int(4)], vec![text("z"), int(3)], vec![text("x"), int(3)]]
+        );
+        assert_eq!(
+            rows(&db, "SELECT c, MAX(a) FROM kv GROUP BY 1 ORDER BY 2 DESC LIMIT 2"),
+            vec![vec![text("z"), int(90)], vec![text("y"), int(60)]]
+        );
+        assert_eq!(
+            rows(&db, "SELECT c FROM kv GROUP BY c ORDER BY SUM(a) DESC LIMIT 1 OFFSET 1"),
+            vec![vec![text("y")]]
+        );
+        // A plain column comes from the first row of its group.
+        assert_eq!(
+            rows(&db, "SELECT id, c FROM kv GROUP BY c"),
+            vec![vec![int(0), text("x")], vec![int(3), text("y")], vec![int(7), text("z")]]
+        );
+        // The WHERE is asked before the grouping, and a group can be
+        // something worked out.
+        assert_eq!(
+            rows(&db, "SELECT id / 5, COUNT(*) FROM kv WHERE id > 1 GROUP BY id / 5"),
+            vec![vec![int(0), int(3)], vec![int(1), int(5)]]
+        );
+        assert_eq!(rows(&db, "SELECT c, COUNT(*) FROM kv WHERE id > 99 GROUP BY c"), Vec::<Row>::new());
+        assert!(db.prepare("SELECT c FROM kv GROUP BY COUNT(*)").is_err());
+        assert!(db.prepare("SELECT c FROM kv GROUP BY 2").is_err());
+        assert!(db.prepare("SELECT c FROM kv ORDER BY COUNT(*)").is_err());
+    }
+
+    #[test]
+    fn distinct_limit_and_offset_cut_the_rows() {
+        let mut db = kv();
+        db.execute("UPDATE kv SET a = id / 4", &[]).unwrap();
+        assert_eq!(ids(&db, "SELECT DISTINCT a FROM kv"), vec![0, 1, 2]);
+        assert_eq!(ids(&db, "SELECT DISTINCT a FROM kv ORDER BY a DESC LIMIT 2"), vec![2, 1]);
+        assert_eq!(ids(&db, "SELECT DISTINCT a FROM kv LIMIT 1 OFFSET 1"), vec![1]);
+        assert_eq!(rows(&db, "SELECT DISTINCT a, a + 1 FROM kv WHERE id < 5").len(), 2);
+        assert_eq!(ids(&db, "SELECT id FROM kv LIMIT 3 OFFSET 2"), vec![2, 3, 4]);
+        assert_eq!(ids(&db, "SELECT id FROM kv ORDER BY id DESC LIMIT 3 OFFSET 8"), vec![1, 0]);
+        assert_eq!(ids(&db, "SELECT id FROM kv LIMIT -1 OFFSET 8"), vec![8, 9]);
+        assert_eq!(ids(&db, "SELECT id FROM kv LIMIT 2 OFFSET 99"), NONE);
+        assert_eq!(ids(&db, "SELECT id FROM kv LIMIT 0"), NONE);
+        let s = db.prepare("SELECT id FROM kv ORDER BY id LIMIT ?1 OFFSET ?2").unwrap();
+        assert_eq!(s.query(&db, &[int(2), int(5)]).unwrap().rows(), &[vec![int(5)], vec![int(6)]]);
+        assert!(s.query(&db, &[text("two"), int(0)]).is_err());
+        assert!(db.prepare("SELECT id FROM kv LIMIT a").is_err());
+        // An aggregate gives one row, which a LIMIT or an OFFSET can hide.
+        assert_eq!(rows(&db, "SELECT COUNT(*) FROM kv LIMIT 5"), vec![vec![int(10)]]);
+        assert_eq!(rows(&db, "SELECT COUNT(*) FROM kv LIMIT 1 OFFSET 1"), Vec::<Row>::new());
+        assert_eq!(rows(&db, "SELECT SUM(a) FROM kv WHERE id > 7 LIMIT 0"), Vec::<Row>::new());
+        // The keys an index holds are cut the same way.
+        db.execute("CREATE INDEX kv_a ON kv (a)", &[]).unwrap();
+        assert_eq!(ids(&db, "SELECT id FROM kv WHERE a = 0 LIMIT 2 OFFSET 1"), vec![1, 2]);
+        assert_eq!(ids(&db, "SELECT id FROM kv WHERE a = 0 ORDER BY id DESC LIMIT 2 OFFSET 1"), vec![2, 1]);
+        assert_eq!(ids(&db, "SELECT DISTINCT a FROM kv WHERE a = 1"), vec![1]);
+    }
+
+    #[test]
+    fn a_query_inside_another_is_answered_first() {
+        let mut db = kv();
+        assert_eq!(ids(&db, "SELECT id FROM kv WHERE id > (SELECT MAX(id) FROM kv) - 3"), vec![7, 8, 9]);
+        assert_eq!(ids(&db, "SELECT id FROM kv WHERE a IN (SELECT a FROM kv WHERE id < 2)"), vec![0, 1]);
+        assert_eq!(ids(&db, "SELECT id FROM kv WHERE a NOT IN (SELECT a FROM kv WHERE id > 1)"), vec![0, 1]);
+        assert_eq!(
+            ids(&db, "SELECT id FROM kv WHERE id IN (SELECT id FROM kv WHERE a > (SELECT MIN(a) FROM kv) + 70)"),
+            vec![8, 9]
+        );
+        // A query that finds no row stands for null.
+        assert_eq!(ids(&db, "SELECT id FROM kv WHERE a = (SELECT a FROM kv WHERE id = 99)"), NONE);
+        assert_eq!(rows(&db, "SELECT (SELECT COUNT(*) FROM kv) FROM kv WHERE id = 0"), vec![vec![int(10)]]);
+
+        // Prepared once, it is answered again each time it runs.
+        let s = db.prepare("SELECT id FROM kv WHERE id = (SELECT MAX(id) FROM kv WHERE a < ?1)").unwrap();
+        assert!(!s.is_point_lookup());
+        assert_eq!(s.kind(), Kind2::Reads);
+        assert_eq!(s.query(&db, &[int(35)]).unwrap().rows(), &[vec![int(3)]]);
+        db.execute("DELETE FROM kv WHERE id = 3", &[]).unwrap();
+        assert_eq!(s.query(&db, &[int(35)]).unwrap().rows(), &[vec![int(2)]]);
+
+        // A change can lean on one too, also a change to the table asked.
+        let out = db.execute("DELETE FROM kv WHERE id IN (SELECT id FROM kv WHERE a >= 70)", &[]).unwrap();
+        assert_eq!(out.changed(), 3);
+        db.execute("UPDATE kv SET a = (SELECT MAX(a) FROM kv) + 1 WHERE id = 0", &[]).unwrap();
+        db.execute("INSERT INTO kv (id, a) VALUES ((SELECT MAX(id) FROM kv) + 1, 5)", &[]).unwrap();
+        assert_eq!(rows(&db, "SELECT id, a FROM kv WHERE id IN (0, 7)"), vec![vec![int(0), int(61)], vec![int(7), int(5)]]);
+
+        // What can be checked at prepare time is checked then.
+        assert!(db.prepare("SELECT id FROM kv WHERE a IN (SELECT nope FROM kv)").is_err());
+        assert!(db.prepare("SELECT id FROM kv WHERE a IN (SELECT id, a FROM kv)").is_err());
+        assert!(db.prepare("SELECT id FROM kv WHERE nope IN (SELECT id FROM kv)").is_err());
+        assert!(db.prepare("SELECT id FROM kv WHERE a = (SELECT * FROM kv)").is_err());
+    }
+
+    #[test]
+    fn a_sum_of_numbers_still_finds_rows_by_key() {
+        let db = kv();
+        assert_eq!(ids(&db, "SELECT id FROM kv WHERE id > 10 - 3"), vec![8, 9]);
+        assert_eq!(ids(&db, "SELECT id FROM kv WHERE id BETWEEN 1 + 1 AND 2 * 2"), vec![2, 3, 4]);
+        // Worked out at prepare time, it is a lookup by key like any other.
+        assert!(db.prepare("SELECT a FROM kv WHERE id = 2 * 3").unwrap().is_point_lookup());
+        // Only a whole number is taken that way. The rest is asked of each row.
+        assert!(!db.prepare("SELECT a FROM kv WHERE id = 7 / 2.0").unwrap().is_point_lookup());
+        assert_eq!(ids(&db, "SELECT id FROM kv WHERE id > 15 / 2.0"), vec![8, 9]);
+    }
+
+    #[test]
+    fn alter_table_adds_a_column_to_every_row() {
+        let mut db = kv();
+        db.execute("ALTER TABLE kv ADD COLUMN n INTEGER DEFAULT 7", &[]).unwrap();
+        db.execute("ALTER TABLE kv ADD COLUMN note TEXT", &[]).unwrap();
+        assert_eq!(rows(&db, "SELECT id, n, note FROM kv WHERE id = 2"), vec![vec![int(2), int(7), Value::Null]]);
+        db.execute("INSERT INTO kv (id, a) VALUES (50, 1)", &[]).unwrap();
+        db.execute("UPDATE kv SET note = 'hi' WHERE id = 50", &[]).unwrap();
+        assert_eq!(rows(&db, "SELECT n, note FROM kv WHERE id = 50"), vec![vec![int(7), text("hi")]]);
+        assert_eq!(rows(&db, "SELECT * FROM kv WHERE id = 2")[0].len(), 6);
+        db.execute("CREATE INDEX kv_n ON kv (n)", &[]).unwrap();
+        assert_eq!(rows(&db, "SELECT COUNT(*) FROM kv WHERE n = 7"), vec![vec![int(11)]]);
+
+        // A name already there, a NOT NULL with nothing to put in the old
+        // rows, a default of the wrong kind, a table that is not there.
+        assert!(db.execute("ALTER TABLE kv ADD COLUMN n TEXT", &[]).is_err());
+        assert!(db.execute("ALTER TABLE kv ADD COLUMN id TEXT", &[]).is_err());
+        assert!(db.execute("ALTER TABLE kv ADD COLUMN m INTEGER NOT NULL", &[]).is_err());
+        assert!(db.execute("ALTER TABLE kv ADD COLUMN m INTEGER DEFAULT 'x'", &[]).is_err());
+        assert!(db.execute("ALTER TABLE nope ADD COLUMN m INTEGER", &[]).is_err());
+        // And not inside a transaction, where a rollback could not take
+        // the column out of the rows again.
+        db.execute("BEGIN", &[]).unwrap();
+        assert!(db.execute("ALTER TABLE kv ADD COLUMN m INTEGER", &[]).is_err());
+        db.execute("ROLLBACK", &[]).unwrap();
+        db.execute("ALTER TABLE kv ADD COLUMN m INTEGER NOT NULL DEFAULT 0", &[]).unwrap();
+        assert_eq!(rows(&db, "SELECT m FROM kv WHERE id = 50"), vec![vec![int(0)]]);
     }
 }
