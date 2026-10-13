@@ -251,3 +251,40 @@ fn an_added_column_is_still_there_after_a_reopen() {
     db.execute("INSERT INTO kv (id, a) VALUES (3, 30)", &[]).unwrap();
     assert_eq!(rows_of(&db, "SELECT c FROM kv WHERE id = 3"), vec![vec![Value::Text("old".into())]]);
 }
+
+#[test]
+fn a_second_program_cannot_open_the_same_files() {
+    let dir = Dir::new("second");
+    let mut first = Db::open(dir.path()).unwrap();
+    first.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)", &[]).unwrap();
+    // Two open at once would each write where it believes the log ends,
+    // over the other's commits.
+    let second = Db::open(dir.path());
+    assert!(second.is_err(), "a second open got in beside the first");
+    assert!(second.unwrap_err().to_string().contains("another program"));
+    first.execute("INSERT INTO t (a) VALUES ('one')", &[]).unwrap();
+    drop(first);
+    // When the first is gone the files open again, with its rows.
+    let again = Db::open(dir.path()).unwrap();
+    assert_eq!(rows_of(&again, "SELECT a FROM t"), vec![vec![Value::Text("one".into())]]);
+}
+
+#[test]
+fn the_log_can_be_measured_and_written_out_fresh() {
+    let dir = Dir::new("loglen");
+    let mut db = Db::open(dir.path()).unwrap();
+    db.execute("CREATE TABLE kv (k TEXT PRIMARY KEY, v TEXT)", &[]).unwrap();
+    // One large row written over many times: few records, a long log.
+    let big = "x".repeat(100_000);
+    for _ in 0..20 {
+        db.execute("INSERT OR REPLACE INTO kv (k, v) VALUES ('bars', ?1)", &[Value::Text(big.clone())])
+            .unwrap();
+    }
+    assert!(db.log_len() > 2_000_000, "the log is {} bytes", db.log_len());
+    db.checkpoint().unwrap();
+    assert_eq!(db.log_len(), 0);
+    drop(db);
+    let db = Db::open(dir.path()).unwrap();
+    assert_eq!(rows_of(&db, "SELECT k FROM kv"), vec![vec![Value::Text("bars".into())]]);
+    assert_eq!(Db::new().log_len(), 0);
+}

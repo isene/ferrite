@@ -1329,6 +1329,15 @@ impl Db {
         }
     }
 
+    /// Bytes in the log since the last snapshot; 0 for a database in
+    /// memory. The log is written out fresh by itself once it has twice
+    /// as many records as the database has rows. A program that keeps
+    /// writing over a few large rows never gets there, and can call
+    /// [`Db::checkpoint`] when this is large.
+    pub fn log_len(&self) -> u64 {
+        self.store.as_ref().map_or(0, |s| s.log_len())
+    }
+
     /// Write the whole database out fresh and start the log again.
     pub fn checkpoint(&mut self) -> Result<()> {
         let all = self.everything();

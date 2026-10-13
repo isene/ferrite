@@ -503,6 +503,24 @@ impl Store {
         std::fs::create_dir_all(dir).map_err(io)?;
         let mut commits = Vec::new();
 
+        // One program at a time. Two would each write where it believes
+        // the log ends, over the other's commits. The lock is on the log
+        // file and lasts until this `Store` is dropped.
+        let path = Self::log_path(dir);
+        let mut log = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .map_err(io)?;
+        match log.try_lock() {
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(Error::Disk("another program has this database open".into()));
+            }
+            // Held now, or the filesystem has no locks to give.
+            _ => {}
+        }
+
         // The snapshot first: everything as of the moment it was taken.
         let snap = Self::snapshot_path(dir);
         if snap.exists() {
@@ -517,13 +535,6 @@ impl Store {
         }
 
         // Then the log, up to the last record that is whole.
-        let path = Self::log_path(dir);
-        let mut log = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&path)
-            .map_err(io)?;
         let mut bytes = Vec::new();
         log.read_to_end(&mut bytes).map_err(io)?;
         let (mut found, good) = decode_all(&bytes);

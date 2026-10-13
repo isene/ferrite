@@ -110,11 +110,17 @@ assert_eq!(out.rows()[0][0], Value::Text("hello".into()));
 
 `Db::new()` is the same database in memory, gone when the program ends.
 
+The log is written out fresh by itself. That happens once it is over
+4 MB and has twice as many records as the database has rows. A program
+that writes over a few large rows many times can ask `db.log_len()` and
+call `db.checkpoint()` itself.
+
 ## What it is not
 
 A server, a database shared between processes, or a home for more data
-than the machine has memory. One thread in one process. If a table
-would not fit in RAM, or two programs need the same file, use SQLite.
+than the machine has memory. One thread in one process: a second
+program that opens the same directory is refused. If a table would not
+fit in RAM, or two programs need the same file, use SQLite.
 
 ## The name
 
