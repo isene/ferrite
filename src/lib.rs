@@ -327,15 +327,17 @@ impl Table {
         if key >= self.next { self.next = key.saturating_add(1); }
     }
 
-    fn alloc(&mut self, row: Row) -> u32 {
-        match self.free.pop() {
+    /// A slot for a new row. It takes the slab and the free list, not the
+    /// table, so a caller can hold an entry in the key tree meanwhile.
+    fn alloc(slab: &mut Vec<Option<Row>>, free: &mut Vec<u32>, row: Row) -> u32 {
+        match free.pop() {
             Some(slot) => {
-                self.slab[slot as usize] = Some(row);
+                slab[slot as usize] = Some(row);
                 slot
             }
             None => {
-                self.slab.push(Some(row));
-                (self.slab.len() - 1) as u32
+                slab.push(Some(row));
+                (slab.len() - 1) as u32
             }
         }
     }
@@ -343,13 +345,18 @@ impl Table {
     /// Put a row under a key with no checking at all: for undoing and
     /// for replaying the log, where the row has been checked before.
     pub(crate) fn place(&mut self, key: i64, row: Row) -> Option<Row> {
+        use std::collections::btree_map::Entry;
         self.bump(key);
-        if let Some(&slot) = self.rows.get(&key) {
-            return self.slab[slot as usize].replace(row);
+        // One walk down the tree finds the key or the place for it. A
+        // look first and an insert after was two, and opening a database
+        // is mostly this.
+        match self.rows.entry(key) {
+            Entry::Occupied(o) => self.slab[*o.get() as usize].replace(row),
+            Entry::Vacant(v) => {
+                v.insert(Self::alloc(&mut self.slab, &mut self.free, row));
+                None
+            }
         }
-        let slot = self.alloc(row);
-        self.rows.insert(key, slot);
-        None
     }
 
     /// Take a row out and hand it back.
@@ -434,7 +441,7 @@ impl Table {
     /// Put a row in that has already been looked over.
     pub(crate) fn insert_known_good(&mut self, key: i64, row: Row) {
         self.bump(key);
-        let slot = self.alloc(row);
+        let slot = Self::alloc(&mut self.slab, &mut self.free, row);
         self.rows.insert(key, slot);
     }
 
@@ -509,21 +516,73 @@ impl IndexKey {
     }
 }
 
+/// The rows filed under one value of an index, each as its key and its
+/// slot, in key order.
+///
+/// Most values have one row, and every value of a unique index has.
+/// That row sits right in the entry. A tree of its own would cost an
+/// allocation of over 500 bytes for each value, which was most of what
+/// opening a database with a text key cost.
+#[derive(Debug, Clone)]
+pub enum Hits {
+    One(i64, u32),
+    Many(BTreeMap<i64, u32>),
+}
+
+impl Hits {
+    pub fn len(&self) -> usize {
+        match self { Hits::One(..) => 1, Hits::Many(m) => m.len() }
+    }
+
+    pub fn is_empty(&self) -> bool { self.len() == 0 }
+
+    /// Each row's key and slot, in key order.
+    pub fn iter(&self) -> HitsIter<'_> {
+        match self {
+            Hits::One(k, s) => HitsIter::One(Some((*k, *s))),
+            Hits::Many(m) => HitsIter::Many(m.iter()),
+        }
+    }
+
+    pub fn keys(&self) -> impl DoubleEndedIterator<Item = i64> + '_ {
+        self.iter().map(|(k, _)| k)
+    }
+}
+
+/// The walk over [`Hits`], from either end.
+pub enum HitsIter<'a> {
+    One(Option<(i64, u32)>),
+    Many(std::collections::btree_map::Iter<'a, i64, u32>),
+}
+
+impl Iterator for HitsIter<'_> {
+    type Item = (i64, u32);
+    fn next(&mut self) -> Option<(i64, u32)> {
+        match self {
+            HitsIter::One(o) => o.take(),
+            HitsIter::Many(it) => it.next().map(|(k, s)| (*k, *s)),
+        }
+    }
+}
+
+impl DoubleEndedIterator for HitsIter<'_> {
+    fn next_back(&mut self) -> Option<(i64, u32)> {
+        match self {
+            HitsIter::One(o) => o.take(),
+            HitsIter::Many(it) => it.next_back().map(|(k, s)| (*k, *s)),
+        }
+    }
+}
+
 /// One or more columns of one table, with every row that holds each
 /// value.
-///
-/// A single-column index keeps the row's own value beside its key, not
-/// only the value the entry is filed under. Those two can differ: 5 and
-/// 5.0 are equal in SQL, so they share an entry, and only the row knows
-/// which of them it holds. Keeping it here is what lets a query asking
-/// for this column be answered without fetching the row at all.
 #[derive(Debug, Clone)]
 pub struct Index {
     name: String,
     table: TableId,
     columns: Vec<usize>,
     unique: bool,
-    entries: BTreeMap<IndexKey, BTreeMap<i64, (u32, Value)>>,
+    entries: BTreeMap<IndexKey, Hits>,
     dropped: bool,
 }
 
@@ -536,24 +595,36 @@ impl Index {
     pub fn is_unique(&self) -> bool { self.unique }
 
     /// The rows whose value in this one column equals `value`, in key
-    /// order, each with its slot and the value it actually holds.
-    pub fn rows_for(&self, value: &Value) -> Option<&BTreeMap<i64, (u32, Value)>> {
+    /// order, each with its slot.
+    pub fn rows_for(&self, value: &Value) -> Option<&Hits> {
         self.entries.get(&IndexKey::One(SortKey(value.clone())))
+    }
+
+    /// The same rows, with the value their entry is filed under. Every
+    /// value in a column is of one kind, so that is each row's own value
+    /// too, and a query asking for the key and this column reads no row.
+    /// It can differ from `value`: a lookup for 5 finds the 5.0 stored in
+    /// a REAL column.
+    pub(crate) fn filed(&self, value: &Value) -> Option<(&Value, &Hits)> {
+        match self.entries.get_key_value(&IndexKey::One(SortKey(value.clone())))? {
+            (IndexKey::One(SortKey(v)), hits) => Some((v, hits)),
+            _ => None,
+        }
     }
 
     /// The rows whose values in the index's columns equal these, in
     /// that order.
-    pub fn rows_for_all(&self, values: &[Value]) -> Option<&BTreeMap<i64, (u32, Value)>> {
+    pub fn rows_for_all(&self, values: &[Value]) -> Option<&Hits> {
         self.entries.get(&Self::key_from(values))
     }
 
     /// Just the keys of those rows.
-    pub fn keys_for(&self, value: &Value) -> Option<impl Iterator<Item = &i64>> {
-        self.rows_for(value).map(|m| m.keys())
+    pub fn keys_for(&self, value: &Value) -> Option<impl Iterator<Item = i64> + '_> {
+        self.rows_for(value).map(|h| h.keys())
     }
 
     /// Every value in order, with the rows holding it.
-    pub fn iter(&self) -> impl Iterator<Item = (&IndexKey, &BTreeMap<i64, (u32, Value)>)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&IndexKey, &Hits)> {
         self.entries.iter()
     }
 
@@ -572,29 +643,34 @@ impl Index {
         }
     }
 
-    /// The value kept beside the key: the row's own, for one column.
-    fn own(&self, row: &Row) -> Value {
-        match self.columns.as_slice() {
-            [c] => row[*c].clone(),
-            _ => Value::Null,
+    fn add(&mut self, key: IndexKey, row_key: i64, slot: u32) {
+        use std::collections::btree_map::Entry;
+        match self.entries.entry(key) {
+            Entry::Vacant(v) => { v.insert(Hits::One(row_key, slot)); }
+            Entry::Occupied(mut o) => {
+                let hits = o.get_mut();
+                match hits {
+                    Hits::One(k, s) if *k == row_key => *s = slot,
+                    Hits::One(k, s) => *hits = Hits::Many(BTreeMap::from([(*k, *s), (row_key, slot)])),
+                    Hits::Many(m) => { m.insert(row_key, slot); }
+                }
+            }
         }
-    }
-
-    fn add(&mut self, key: IndexKey, own: Value, row_key: i64, slot: u32) {
-        self.entries.entry(key).or_default().insert(row_key, (slot, own));
     }
 
     fn remove(&mut self, key: &IndexKey, row_key: i64) {
-        if let Some(rows) = self.entries.get_mut(key) {
-            rows.remove(&row_key);
-            if rows.is_empty() { self.entries.remove(key); }
-        }
+        let Some(hits) = self.entries.get_mut(key) else { return };
+        let gone = match hits {
+            Hits::One(k, _) => *k == row_key,
+            Hits::Many(m) => { m.remove(&row_key); m.is_empty() }
+        };
+        if gone { self.entries.remove(key); }
     }
 
     /// The key of a row, other than `except`, filed under this key.
     fn clash(&self, key: &IndexKey, except: i64) -> Option<i64> {
         if !self.unique || key.has_null() { return None; }
-        self.entries.get(key)?.keys().find(|k| **k != except).copied()
+        self.entries.get(key)?.keys().find(|k| *k != except)
     }
 }
 
@@ -951,7 +1027,7 @@ impl Db {
             if let Some(other) = index.clash(&k, key) {
                 return Err(Error::Unique(format!("{} (rows {other} and {key})", index.what())));
             }
-            index.add(k, index.own(row), key, slot);
+            index.add(k, key, slot);
         }
         let column_names: Vec<String> =
             index.columns.iter().map(|&c| self.tables[table.0].columns[c].name.clone()).collect();
@@ -1009,13 +1085,26 @@ impl Db {
 
     fn fill_index(&mut self, slot: usize) {
         let table = self.indexes[slot].table;
-        let triples: Vec<(i64, u32, IndexKey, Value)> = self.tables[table.0]
+        let mut triples: Vec<(IndexKey, i64, u32)> = self.tables[table.0]
             .iter_slots()
-            .map(|(k, s, row)| (k, s, self.indexes[slot].key_of(row), self.indexes[slot].own(row)))
+            .map(|(k, s, row)| (self.indexes[slot].key_of(row), k, s))
             .collect();
-        for (key, at, k, own) in triples {
-            self.indexes[slot].add(k, own, key, at);
+        // Sorted first, the tree is built in one pass with no search for
+        // each value. A row key breaks a tie, so rows sharing a value
+        // stay in key order.
+        triples.sort_unstable_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+        let mut built: Vec<(IndexKey, Hits)> = Vec::with_capacity(triples.len());
+        for (k, key, at) in triples {
+            match built.last_mut() {
+                // By order, not by ==, which says a NaN differs from itself.
+                Some((last, hits)) if (*last).cmp(&k).is_eq() => match hits {
+                    Hits::One(k0, s0) => *hits = Hits::Many(BTreeMap::from([(*k0, *s0), (key, at)])),
+                    Hits::Many(m) => { m.insert(key, at); }
+                },
+                _ => built.push((k, Hits::One(key, at))),
+            }
         }
+        self.indexes[slot].entries = built.into_iter().collect();
     }
 
     /// Put a row into every index watching its table.
@@ -1024,8 +1113,7 @@ impl Db {
         let Some(at) = self.tables[table.0].slot_of(key) else { return };
         for slot in self.tables[table.0].watchers.clone() {
             let k = self.indexes[slot].key_of(row);
-            let own = self.indexes[slot].own(row);
-            self.indexes[slot].add(k, own, key, at);
+            self.indexes[slot].add(k, key, at);
         }
     }
 
@@ -1215,12 +1303,13 @@ impl Db {
         self.tables[table.0].update(key, column, value)?;
         if !touched.is_empty() {
             let at = self.tables[table.0].slot_of(key).expect("the row that was just changed");
-            let row = self.tables[table.0].get(key).expect("the row that was just changed").clone();
-            for (slot, was) in touched {
+            let row = self.tables[table.0].get(key).expect("the row that was just changed");
+            let moves: Vec<(usize, IndexKey, IndexKey)> = touched.into_iter()
+                .map(|(slot, was)| (slot, was, self.indexes[slot].key_of(row)))
+                .collect();
+            for (slot, was, k) in moves {
                 self.indexes[slot].remove(&was, key);
-                let k = self.indexes[slot].key_of(&row);
-                let own = self.indexes[slot].own(&row);
-                self.indexes[slot].add(k, own, key, at);
+                self.indexes[slot].add(k, key, at);
             }
         }
         self.close_if_alone()
@@ -1264,7 +1353,7 @@ impl Db {
             for fk in fks {
                 let want = Value::Int(key);
                 let keys: Vec<i64> = match self.index_on(TableId(c), fk.column) {
-                    Some(ix) => self.indexes[ix.0].keys_for(&want).map(|k| k.copied().collect()).unwrap_or_default(),
+                    Some(ix) => self.indexes[ix.0].keys_for(&want).map(|k| k.collect()).unwrap_or_default(),
                     None => self.tables[c].iter().filter(|(_, r)| r[fk.column] == want).map(|(k, _)| k).collect(),
                 };
                 if keys.is_empty() { continue; }
@@ -1664,7 +1753,7 @@ mod tests {
         assert!(db.index_id("kv_bc").is_err());
         db.create_index_full("kv_bc", id, vec![1, 2], false).unwrap();
         let ix = db.index_id("kv_bc").unwrap();
-        let both: Vec<i64> = db.index(ix).rows_for_all(&[Value::Real(1.0), Value::Text("x".into())]).unwrap().keys().copied().collect();
+        let both: Vec<i64> = db.index(ix).rows_for_all(&[Value::Real(1.0), Value::Text("x".into())]).unwrap().keys().collect();
         assert_eq!(both, vec![5, 6]);
         assert_eq!(db.index_within(id, &[2, 1, 0]), Some(ix));
         assert_eq!(db.index_within(id, &[2]), None);

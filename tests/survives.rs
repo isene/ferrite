@@ -253,6 +253,33 @@ fn an_added_column_is_still_there_after_a_reopen() {
 }
 
 #[test]
+fn an_index_finds_every_row_after_a_reopen() {
+    let dir = Dir::new("index");
+    {
+        let mut db = Db::open(dir.path()).unwrap();
+        db.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, x REAL)", &[]).unwrap();
+        db.execute("CREATE INDEX t_name ON t (name)", &[]).unwrap();
+        db.execute("CREATE INDEX t_x ON t (x)", &[]).unwrap();
+        let t = db.table_id("t").unwrap();
+        for (k, name, x) in [(1, "b", 1.0), (2, "a", f64::NAN), (3, "b", 2.0), (4, "c", f64::NAN), (5, "b", 3.0)] {
+            db.insert(t, k, vec![Value::Text(name.into()), Value::Real(x)]).unwrap();
+        }
+    }
+    let db = Db::open(dir.path()).unwrap();
+    let ix = db.index_id("t_name").unwrap();
+    let keys: Vec<i64> = db.index(ix).keys_for(&Value::Text("b".into())).unwrap().collect();
+    assert_eq!(keys, vec![1, 3, 5]);
+    // Two NaNs are one value to an index, though == says they differ.
+    let ix = db.index_id("t_x").unwrap();
+    let keys: Vec<i64> = db.index(ix).keys_for(&Value::Real(f64::NAN)).unwrap().collect();
+    assert_eq!(keys, vec![2, 4]);
+    assert_eq!(
+        rows_of(&db, "SELECT id FROM t WHERE name = 'b' ORDER BY id DESC"),
+        vec![vec![Value::Int(5)], vec![Value::Int(3)], vec![Value::Int(1)]]
+    );
+}
+
+#[test]
 fn a_second_program_cannot_open_the_same_files() {
     let dir = Dir::new("second");
     let mut first = Db::open(dir.path()).unwrap();

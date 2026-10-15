@@ -452,6 +452,34 @@ The machine drifts about ten percent between runs of the same binary,
 which is why a regression is only believed when the old build is run
 right after the new one.
 
+## Opening faster (v0.2.0)
+
+Median of 30 opens of a copy of each app's files, the old build run
+right after the new one:
+
+| database | rows | before | after |
+|---|---:|---:|---:|
+| watchit, three indexes on text keys | 2 965 | 3.35 ms | 2.76 ms |
+| tock, a 2.3 MB snapshot | 566 | 2.97 ms | 2.45 ms |
+
+Four changes:
+
+- A value with one row keeps that row in its index entry. Each value
+  had a tree of its own before, an allocation of over 500 bytes.
+- The index no longer copies the row's value. Every value in a column
+  is of one kind, so the value an entry is filed under is the row's own.
+- An index is built from a sorted list in one pass, and a row is placed
+  with one walk down the key tree instead of a look and an insert.
+- The checksum runs three streams side by side and joins them. A 760 KB
+  snapshot is checked in 0.10 ms instead of 0.21.
+
+Decoding is 1.6 ms of watchit's 2.76, left as is. Most of it is one
+allocation and one UTF-8 check for each of its 24 000 texts. Skipping
+the check would save 0.3 ms and let a damaged file break memory safety.
+
+Every bench row stayed inside its spread. A text column through an
+index went from 242 µs to 207 µs, since the index entries are smaller.
+
 ## A trap this bench fell into
 
 The first run reported a 3 µs fsync and near-identical FULL and NORMAL

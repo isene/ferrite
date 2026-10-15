@@ -1746,17 +1746,17 @@ fn keys_from_index(
     let value = value_of(&args[0], params)?;
     let mut out = Vec::new();
     if *value == Value::Null { return Ok(Some(out)); }
-    let Some(rows) = db.index(*index).rows_for(value) else { return Ok(Some(out)) };
-    let make = |key: &i64, held: &Value| -> Row {
+    let Some((held, rows)) = db.index(*index).filed(value) else { return Ok(Some(out)) };
+    let make = |(key, _): (i64, u32)| -> Row {
         picks
             .iter()
-            .map(|p| if *p == Pick::Key(0) { Value::Int(*key) } else { held.clone() })
+            .map(|p| if *p == Pick::Key(0) { Value::Int(key) } else { held.clone() })
             .collect()
     };
     if desc {
-        rows.iter().rev().skip(skip).take(take).for_each(|(k, (_, v))| out.push(make(k, v)));
+        rows.iter().rev().skip(skip).take(take).for_each(|h| out.push(make(h)));
     } else {
-        rows.iter().skip(skip).take(take).for_each(|(k, (_, v))| out.push(make(k, v)));
+        rows.iter().skip(skip).take(take).for_each(|h| out.push(make(h)));
     }
     Ok(Some(out))
 }
@@ -1941,9 +1941,9 @@ fn visit(
             }
             JoinBy::Index(index) => {
                 let Some(rows) = db.index(*index).rows_for(&value) else { return Ok(true) };
-                for (k, (slot, _)) in rows {
-                    let Some(r) = right.at_slot(*slot) else { continue };
-                    let both = [(key, row), (*k, r)];
+                for (k, slot) in rows.iter() {
+                    let Some(r) = right.at_slot(slot) else { continue };
+                    let both = [(key, row), (k, r)];
                     if (passes(&filter.after_join, &both, params)? && holds(&filter.other_after, &both, params)?) && !each(&both)? {
                         return Ok(false);
                     }
@@ -1973,9 +1973,9 @@ fn visit(
         Find::Index { index, args } => {
             let Some(values) = values_of(args, params)? else { return Ok(()) };
             if let Some(rows) = db.index(*index).rows_for_all(&values) {
-                for (key, (slot, _)) in rows {
-                    let Some(row) = t.at_slot(*slot) else { continue };
-                    if !go(*key, row)? { break; }
+                for (key, slot) in rows.iter() {
+                    let Some(row) = t.at_slot(slot) else { continue };
+                    if !go(key, row)? { break; }
                 }
             }
         }
