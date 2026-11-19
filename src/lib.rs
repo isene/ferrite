@@ -1386,6 +1386,20 @@ impl Db {
     /// Open a database and say how hard a commit should try to survive.
     pub fn open_with(dir: impl AsRef<Path>, durability: Durability) -> Result<Db> {
         let (store, commits) = Store::open(dir.as_ref(), durability)?;
+        let mut db = Db::from_commits(commits)?;
+        db.store = Some(store);
+        Ok(db)
+    }
+
+    /// Read a database in a directory as it is now, while another program
+    /// may have it open. Takes no lock and never writes to the files. What
+    /// comes back lives in memory: a change made to it is kept there and
+    /// never reaches the disk.
+    pub fn read_only(dir: impl AsRef<Path>) -> Result<Db> {
+        Db::from_commits(Store::read(dir.as_ref())?)
+    }
+
+    fn from_commits(commits: Vec<Vec<log::Change>>) -> Result<Db> {
         let mut db = Db::new();
         for commit in commits {
             db.replay(commit)?;
@@ -1395,7 +1409,6 @@ impl Db {
         for slot in 0..db.indexes.len() {
             if !db.indexes[slot].dropped { db.fill_index(slot); }
         }
-        db.store = Some(store);
         Ok(db)
     }
 

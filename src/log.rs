@@ -621,6 +621,42 @@ impl Store {
         ))
     }
 
+    /// Read what a database directory holds without opening it: no lock,
+    /// no file made, nothing cut or written. Another program may have it
+    /// open and be writing. A commit it is halfway through is left out,
+    /// and if it starts the log again meanwhile, the read starts again.
+    pub fn read(dir: &Path) -> Result<Vec<Vec<Change>>> {
+        let snap = Self::snapshot_path(dir);
+        let log = Self::log_path(dir);
+        let stamp = |p: &Path| std::fs::metadata(p).ok().map(|m| (m.len(), m.modified().ok()));
+        let read = |p: &Path| match std::fs::read(p) {
+            Ok(b) => Ok(b),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+            Err(e) => Err(io(e)),
+        };
+        for _ in 0..5 {
+            let before = stamp(&snap);
+            let mut commits = Vec::new();
+            let bytes = read(&snap)?;
+            let (mut found, used) = decode_all(&bytes);
+            if used != bytes.len() {
+                if stamp(&snap) != before { continue; }
+                return Err(Error::Disk("the snapshot is damaged".into()));
+            }
+            commits.append(&mut found);
+            let bytes = read(&log)?;
+            let (mut found, _) = decode_all(&bytes);
+            commits.append(&mut found);
+            // A new snapshot, or a log shorter than what was read, means
+            // the writer started the log again between the two reads.
+            let log_now = stamp(&log).map_or(0, |s| s.0);
+            if stamp(&snap) == before && log_now >= bytes.len() as u64 {
+                return Ok(commits);
+            }
+        }
+        Err(Error::Disk("the database kept changing while it was read".into()))
+    }
+
     /// Write one commit. In FULL it is on the disk when this returns; in
     /// NORMAL it has reached the operating system, which is enough to
     /// survive the program dying but not the power going.

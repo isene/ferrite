@@ -110,6 +110,11 @@ assert_eq!(out.rows()[0][0], Value::Text("hello".into()));
 
 `Db::new()` is the same database in memory, gone when the program ends.
 
+`Db::read_only(dir)` reads a directory that another program has open,
+as it is at that moment. It takes no lock and writes nothing. A commit
+the other program is halfway through is left out, and changes made to
+the copy stay in memory.
+
 The log is written out fresh by itself. That happens once it is over
 4 MB and has twice as many records as the database has rows. A program
 that writes over a few large rows many times can ask `db.log_len()` and
@@ -119,7 +124,8 @@ call `db.checkpoint()` itself.
 
 A server, a database shared between processes, or a home for more data
 than the machine has memory. One thread in one process: a second
-program that opens the same directory is refused. If a table would not
+program that opens the same directory is refused, though it may read it
+with `Db::read_only`. If a table would not
 fit in RAM, or two programs need the same file, use SQLite.
 
 ## The name

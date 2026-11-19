@@ -297,6 +297,41 @@ fn a_second_program_cannot_open_the_same_files() {
 }
 
 #[test]
+fn a_second_program_can_read_while_the_first_writes() {
+    let dir = Dir::new("reader");
+    let mut first = Db::open(dir.path()).unwrap();
+    first.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT)", &[]).unwrap();
+    first.execute("INSERT INTO t (a) VALUES ('one')", &[]).unwrap();
+    first.checkpoint().unwrap();
+    first.execute("INSERT INTO t (a) VALUES ('two')", &[]).unwrap();
+    let files = || ["log", "snapshot"].map(|f| std::fs::read(dir.path().join(f)).unwrap());
+    let before = files();
+
+    // The snapshot and then the log, with the first still holding the lock.
+    let mut reader = Db::read_only(dir.path()).unwrap();
+    let both = vec![vec![Value::Text("one".into())], vec![Value::Text("two".into())]];
+    assert_eq!(rows_of(&reader, "SELECT a FROM t ORDER BY id"), both);
+    // A change to what was read stays in memory.
+    reader.execute("DELETE FROM t", &[]).unwrap();
+    assert_eq!(files(), before, "the reader wrote to the files");
+
+    // A commit the first is halfway through is left out, and left alone.
+    let log = dir.path().join("log");
+    let mut bytes = std::fs::read(&log).unwrap();
+    let whole = bytes.len();
+    bytes.extend_from_slice(&[7, 0, 0, 0, 1, 2]);
+    std::fs::write(&log, &bytes).unwrap();
+    assert_eq!(rows_of(&Db::read_only(dir.path()).unwrap(), "SELECT a FROM t ORDER BY id"), both);
+    assert_eq!(std::fs::read(&log).unwrap().len(), whole + 6, "the reader cut the log");
+
+    // A directory with nothing in it reads as an empty database.
+    let empty = Dir::new("reader-empty");
+    std::fs::create_dir_all(empty.path()).unwrap();
+    assert!(Db::read_only(empty.path()).unwrap().query("SELECT * FROM t", &[]).is_err());
+    assert_eq!(std::fs::read_dir(empty.path()).unwrap().count(), 0);
+}
+
+#[test]
 fn the_log_can_be_measured_and_written_out_fresh() {
     let dir = Dir::new("loglen");
     let mut db = Db::open(dir.path()).unwrap();
